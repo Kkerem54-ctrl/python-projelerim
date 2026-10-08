@@ -1,0 +1,601 @@
+import math
+import tkinter as tk
+from copy import deepcopy
+from pathlib import Path
+from tkinter import messagebox, ttk
+
+from student_tracker import calculate_average, load_students, save_students
+
+
+DATA_FILE = Path(__file__).with_name("students.json")
+BG = "#f3f6fb"
+NAVY = "#172554"
+BLUE = "#2563eb"
+MUTED = "#64748b"
+GREEN = "#15803d"
+RED = "#b91c1c"
+
+
+class StudentTrackerWindow:
+    """Öğrenci not sisteminin Tkinter masaüstü arayüzü."""
+
+    def __init__(self, root: tk.Tk, data_path: Path = DATA_FILE) -> None:
+        self.root = root
+        self.data_path = data_path
+        self.students = load_students(data_path)
+        self.selected_page = "Özet"
+
+        root.title("Öğrenci Not Takip Sistemi")
+        root.geometry("1120x720")
+        root.minsize(900, 600)
+        root.configure(bg=BG)
+
+        style = ttk.Style(root)
+        style.theme_use("clam")
+        style.configure("TFrame", background=BG)
+        style.configure("TLabel", background=BG, foreground=NAVY, font=("Segoe UI", 10))
+        style.configure("Heading.TLabel", font=("Segoe UI", 23, "bold"))
+        style.configure("Subheading.TLabel", foreground=MUTED, font=("Segoe UI", 10))
+        style.configure("Treeview", rowheight=34, font=("Segoe UI", 10), background="white")
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        style.map("Treeview", background=[("selected", "#dbeafe")],
+                  foreground=[("selected", NAVY)])
+        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(13, 9))
+        style.configure("TButton", font=("Segoe UI", 10), padding=(10, 8))
+        style.configure("Card.TFrame", background="white")
+        style.configure("CardTitle.TLabel", background="white", foreground=MUTED)
+        style.configure("CardValue.TLabel", background="white", font=("Segoe UI", 22, "bold"))
+
+        self.sidebar = tk.Frame(root, bg=NAVY, width=220)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
+        tk.Label(
+            self.sidebar, text="ÖĞRENCİ\nTAKİP", bg=NAVY, fg="white",
+            font=("Segoe UI", 18, "bold"), justify="left",
+        ).pack(anchor="w", padx=24, pady=(28, 6))
+        tk.Label(
+            self.sidebar, text="NOT VE DERS SİSTEMİ", bg=NAVY, fg="#a5b4fc",
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w", padx=24, pady=(0, 30))
+
+        self.nav_buttons: dict[str, tk.Button] = {}
+        for label in ("Özet", "Öğrenciler", "Notlar", "İstatistikler"):
+            button = tk.Button(
+                self.sidebar,
+                text=f"  {label}",
+                anchor="w",
+                relief="flat",
+                bd=0,
+                padx=16,
+                pady=12,
+                bg=NAVY,
+                fg="#dbeafe",
+                activebackground="#1e3a8a",
+                activeforeground="white",
+                font=("Segoe UI", 11),
+                command=lambda page=label: self.show_page(page),
+            )
+            button.pack(fill="x", padx=12, pady=3)
+            self.nav_buttons[label] = button
+
+        tk.Label(
+            self.sidebar, text="Veriler students.json dosyasına kaydedilir.",
+            bg=NAVY, fg="#cbd5e1", font=("Segoe UI", 8), wraplength=175, justify="left",
+        ).pack(side="bottom", anchor="w", padx=24, pady=22)
+
+        self.content = ttk.Frame(root, padding=(30, 24))
+        self.content.pack(side="left", fill="both", expand=True)
+        self.show_page("Özet")
+
+    def _save(self, previous: list[dict]) -> bool:
+        try:
+            save_students(self.students, self.data_path)
+        except OSError as error:
+            self.students[:] = previous
+            messagebox.showerror("Kaydetme hatası", str(error), parent=self.root)
+            return False
+        return True
+
+    def _clear_content(self) -> None:
+        for child in self.content.winfo_children():
+            child.destroy()
+
+    def _heading(self, title: str, subtitle: str) -> ttk.Frame:
+        header = ttk.Frame(self.content)
+        header.pack(fill="x", pady=(0, 22))
+        ttk.Label(header, text=title, style="Heading.TLabel").pack(anchor="w")
+        ttk.Label(header, text=subtitle, style="Subheading.TLabel").pack(
+            anchor="w", pady=(4, 0)
+        )
+        return header
+
+    def _button(self, parent: tk.Misc, text: str, command, primary: bool = False) -> ttk.Button:
+        return ttk.Button(
+            parent,
+            text=text,
+            command=command,
+            style="Primary.TButton" if primary else "TButton",
+        )
+
+    def show_page(self, page: str) -> None:
+        self.selected_page = page
+        for label, button in self.nav_buttons.items():
+            button.configure(
+                bg="#1e3a8a" if label == page else NAVY,
+                fg="white" if label == page else "#dbeafe",
+            )
+        self._clear_content()
+        {
+            "Özet": self._show_dashboard,
+            "Öğrenciler": self._show_students,
+            "Notlar": self._show_grades,
+            "İstatistikler": self._show_statistics,
+        }[page]()
+
+    def _show_dashboard(self) -> None:
+        self._heading("Genel Bakış", "Öğrenci ve başarı durumunun özeti")
+        count = len(self.students)
+        passed = sum(calculate_average(student) >= 50 for student in self.students)
+        failed = count - passed
+        average = (
+            sum(student["average"] for student in self.students) / count if count else 0
+        )
+
+        cards = ttk.Frame(self.content)
+        cards.pack(fill="x", pady=(0, 22))
+        for title, value, color in (
+            ("Toplam öğrenci", str(count), BLUE),
+            ("Başarılı", str(passed), GREEN),
+            ("Başarısız", str(failed), RED),
+            ("Genel ortalama", f"{average:.1f}", NAVY),
+        ):
+            card = ttk.Frame(cards, style="Card.TFrame", padding=(18, 16))
+            card.pack(side="left", fill="both", expand=True, padx=(0, 12))
+            ttk.Label(card, text=title, style="CardTitle.TLabel").pack(anchor="w")
+            ttk.Label(
+                card, text=value, style="CardValue.TLabel", foreground=color
+            ).pack(anchor="w", pady=(8, 0))
+
+        section = ttk.Frame(self.content)
+        section.pack(fill="x", pady=(10, 12))
+        ttk.Label(section, text="Son eklenen öğrenciler", font=("Segoe UI", 14, "bold")).pack(
+            side="left"
+        )
+        self._button(
+            section, "+ Öğrenci ekle", lambda: self._student_form(), primary=True
+        ).pack(side="right")
+        self._student_table(self.content, self.students[-5:][::-1], height=7)
+
+        if not self.students:
+            ttk.Label(
+                self.content,
+                text="Başlamak için “Öğrenci ekle” düğmesini kullanın.",
+                style="Subheading.TLabel",
+            ).pack(anchor="w", pady=12)
+
+    def _student_table(
+        self, parent: tk.Misc, students: list[dict], height: int = 12
+    ) -> ttk.Treeview:
+        columns = ("id", "name", "class", "lessons", "average", "status")
+        table = ttk.Treeview(parent, columns=columns, show="headings", height=height)
+        for column, heading, width in (
+            ("id", "ID", 55),
+            ("name", "Öğrenci", 220),
+            ("class", "Sınıf", 100),
+            ("lessons", "Ders", 75),
+            ("average", "Ortalama", 95),
+            ("status", "Durum", 110),
+        ):
+            table.heading(column, text=heading)
+            table.column(column, width=width, anchor="center" if column != "name" else "w")
+        table.tag_configure("passed", foreground=GREEN)
+        table.tag_configure("failed", foreground=RED)
+        for student in students:
+            average = calculate_average(student)
+            table.insert(
+                "",
+                "end",
+                iid=str(student["id"]),
+                values=(
+                    student["id"],
+                    f"{student['name']} {student['surname']}",
+                    student["class"],
+                    len(student["lessons"]),
+                    f"{average:.1f}",
+                    "Başarılı" if student["passed"] else "Başarısız",
+                ),
+                tags=("passed" if student["passed"] else "failed",),
+            )
+        table.pack(fill="both", expand=True)
+        return table
+
+    def _show_students(self) -> None:
+        header = self._heading("Öğrenciler", "Kayıtlı öğrencileri yönetin ve öğrenci ekleyin")
+        self._button(
+            header, "+ Öğrenci ekle", lambda: self._student_form(), primary=True
+        ).pack(side="right", anchor="e")
+        toolbar = ttk.Frame(self.content)
+        toolbar.pack(fill="x", pady=(0, 12))
+        ttk.Label(toolbar, text="Ara:").pack(side="left", padx=(0, 8))
+        self.search_var = tk.StringVar()
+        search_entry = ttk.Entry(toolbar, textvariable=self.search_var, width=34)
+        search_entry.pack(side="left")
+        self.student_table = self._student_table(self.content, self.students)
+        self.search_var.trace_add("write", lambda *_args: self._filter_students())
+        table = self.student_table
+        table.bind("<Double-1>", lambda _event: self._open_selected_student(table))
+
+        actions = ttk.Frame(self.content)
+        actions.pack(fill="x", pady=(14, 0))
+        self._button(actions, "Ders/notları aç", lambda: self._open_selected_student(table)).pack(
+            side="left", padx=(0, 8)
+        )
+        self._button(actions, "Öğrenciyi sil", lambda: self._delete_selected(table)).pack(
+            side="left"
+        )
+
+    def _filter_students(self) -> None:
+        query = self.search_var.get().strip().casefold()
+        matches = [
+            student
+            for student in self.students
+            if query in student["name"].casefold()
+            or query in student["surname"].casefold()
+        ]
+        for item in self.student_table.get_children():
+            self.student_table.delete(item)
+        for student in matches:
+            average = calculate_average(student)
+            self.student_table.insert(
+                "",
+                "end",
+                iid=str(student["id"]),
+                values=(
+                    student["id"],
+                    f"{student['name']} {student['surname']}",
+                    student["class"],
+                    len(student["lessons"]),
+                    f"{average:.1f}",
+                    "Başarılı" if student["passed"] else "Başarısız",
+                ),
+                tags=("passed" if student["passed"] else "failed",),
+            )
+
+    def _open_selected_student(self, table: ttk.Treeview) -> None:
+        selection = table.selection()
+        if not selection:
+            messagebox.showinfo("Öğrenci seçin", "Önce listeden bir öğrenci seçin.", parent=self.root)
+            return
+        student = next(item for item in self.students if item["id"] == int(selection[0]))
+        self._student_details(student)
+
+    def _delete_selected(self, table: ttk.Treeview) -> None:
+        selection = table.selection()
+        if not selection:
+            messagebox.showinfo("Öğrenci seçin", "Silmek için listeden öğrenci seçin.", parent=self.root)
+            return
+        student = next(item for item in self.students if item["id"] == int(selection[0]))
+        if not messagebox.askyesno(
+            "Öğrenciyi sil",
+            f"{student['name']} {student['surname']} adlı öğrenciyi silmek istiyor musunuz?",
+            parent=self.root,
+        ):
+            return
+        previous = deepcopy(self.students)
+        self.students.remove(student)
+        if self._save(previous):
+            self.show_page(self.selected_page)
+
+    def _student_form(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Yeni öğrenci")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=24)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Yeni öğrenci ekle", font=("Segoe UI", 17, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 14)
+        )
+
+        entries: dict[str, ttk.Entry] = {}
+        for row, (key, label) in enumerate(
+            (("name", "Ad"), ("surname", "Soyad"), ("class", "Sınıf")), start=1
+        ):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=7, padx=(0, 14))
+            entry = ttk.Entry(frame, width=32)
+            entry.grid(row=row, column=1, sticky="ew", pady=7)
+            entries[key] = entry
+
+        def save() -> None:
+            values = {key: entry.get().strip() for key, entry in entries.items()}
+            if not all(values.values()):
+                messagebox.showwarning("Eksik bilgi", "Tüm alanları doldurun.", parent=dialog)
+                return
+            previous = deepcopy(self.students)
+            student_id = max((student["id"] for student in self.students), default=0) + 1
+            self.students.append(
+                {
+                    "id": student_id,
+                    "name": values["name"],
+                    "surname": values["surname"],
+                    "class": values["class"],
+                    "lessons": [],
+                    "average": 0.0,
+                    "passed": False,
+                }
+            )
+            if self._save(previous):
+                dialog.destroy()
+                self.show_page(self.selected_page)
+
+        self._button(frame, "Kaydet", save, primary=True).grid(
+            row=4, column=0, columnspan=2, sticky="ew", pady=(15, 0)
+        )
+        entries["name"].focus_set()
+
+    def _show_grades(self) -> None:
+        self._heading("Ders ve Notlar", "Öğrenci seçerek ders notlarını ekleyin veya düzenleyin")
+        if not self.students:
+            ttk.Label(self.content, text="Önce öğrenci ekleyin.", style="Subheading.TLabel").pack(
+                anchor="w"
+            )
+            return
+
+        selector = ttk.Frame(self.content)
+        selector.pack(fill="x", pady=(0, 18))
+        ttk.Label(selector, text="Öğrenci:").pack(side="left", padx=(0, 10))
+        self.grade_student = ttk.Combobox(
+            selector,
+            state="readonly",
+            width=42,
+            values=[
+                f"{student['id']} - {student['name']} {student['surname']} ({student['class']})"
+                for student in self.students
+            ],
+        )
+        self.grade_student.pack(side="left")
+        self.grade_student.current(0)
+
+        self.lesson_table = ttk.Treeview(
+            self.content,
+            columns=("lesson", "exam1", "exam2", "oral", "average"),
+            show="headings",
+            height=12,
+        )
+        for column, heading, width in (
+            ("lesson", "Ders", 220),
+            ("exam1", "1. Sınav", 120),
+            ("exam2", "2. Sınav", 120),
+            ("oral", "Sözlü", 120),
+            ("average", "Ders ortalaması", 150),
+        ):
+            self.lesson_table.heading(column, text=heading)
+            self.lesson_table.column(column, width=width, anchor="center")
+        self.lesson_table.pack(fill="both", expand=True)
+        self.grade_student.bind("<<ComboboxSelected>>", lambda _event: self._refresh_lessons())
+        self.lesson_table.bind("<Double-1>", lambda _event: self._lesson_form(update=True))
+
+        actions = ttk.Frame(self.content)
+        actions.pack(fill="x", pady=(14, 0))
+        self._button(actions, "+ Ders ekle", lambda: self._lesson_form(update=False), primary=True).pack(
+            side="left", padx=(0, 8)
+        )
+        self._button(actions, "Seçili dersi güncelle", lambda: self._lesson_form(update=True)).pack(
+            side="left"
+        )
+        self._refresh_lessons()
+
+    def _selected_grade_student(self) -> dict:
+        student_id = int(self.grade_student.get().split(" - ", 1)[0])
+        return next(student for student in self.students if student["id"] == student_id)
+
+    def _refresh_lessons(self) -> None:
+        self.lesson_table.delete(*self.lesson_table.get_children())
+        student = self._selected_grade_student()
+        for index, lesson in enumerate(student["lessons"]):
+            self.lesson_table.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    lesson["name"],
+                    f"{lesson['exam1']:g}",
+                    f"{lesson['exam2']:g}",
+                    f"{lesson['oral']:g}",
+                    f"{lesson['average']:g}",
+                ),
+            )
+
+    def _lesson_form(self, update: bool) -> None:
+        student = self._selected_grade_student()
+        selected = self.lesson_table.selection() if update else ()
+        lesson = student["lessons"][int(selected[0])] if selected else None
+        if update and lesson is None:
+            messagebox.showinfo("Ders seçin", "Güncellemek için tablodan ders seçin.", parent=self.root)
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Ders notlarını güncelle" if update else "Ders ekle")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=24)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text="Notları güncelle" if update else "Yeni ders ekle",
+            font=("Segoe UI", 17, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
+
+        entries: dict[str, ttk.Entry] = {}
+        fields = (
+            ("name", "Ders adı", lesson["name"] if lesson else ""),
+            ("exam1", "1. sınav", str(lesson["exam1"]) if lesson else ""),
+            ("exam2", "2. sınav", str(lesson["exam2"]) if lesson else ""),
+            ("oral", "Sözlü", str(lesson["oral"]) if lesson else ""),
+        )
+        for row, (key, label, initial) in enumerate(fields, start=1):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=7, padx=(0, 14))
+            entry = ttk.Entry(frame, width=30)
+            entry.insert(0, initial)
+            entry.grid(row=row, column=1, sticky="ew", pady=7)
+            entries[key] = entry
+        if update:
+            entries["name"].configure(state="readonly")
+
+        def save() -> None:
+            name = entries["name"].get().strip()
+            try:
+                grades = [float(entries[key].get()) for key in ("exam1", "exam2", "oral")]
+            except ValueError:
+                messagebox.showerror("Geçersiz not", "Not alanlarına sayı girin.", parent=dialog)
+                return
+            if not name:
+                messagebox.showwarning("Eksik bilgi", "Ders adı boş bırakılamaz.", parent=dialog)
+                return
+            if any(not math.isfinite(grade) or grade < 0 or grade > 100 for grade in grades):
+                messagebox.showerror(
+                    "Geçersiz not", "Notlar 0 ile 100 arasında olmalıdır.", parent=dialog
+                )
+                return
+            if not update and any(
+                item["name"].casefold() == name.casefold() for item in student["lessons"]
+            ):
+                messagebox.showwarning("Ders mevcut", "Bu ders öğrenciye zaten eklenmiş.", parent=dialog)
+                return
+
+            previous = deepcopy(self.students)
+            record = {
+                "name": name,
+                "exam1": grades[0],
+                "exam2": grades[1],
+                "oral": grades[2],
+                "average": round(sum(grades) / 3, 2),
+            }
+            if update:
+                lesson.update(record)
+            else:
+                student["lessons"].append(record)
+            calculate_average(student)
+            if self._save(previous):
+                dialog.destroy()
+                self._refresh_lessons()
+
+        self._button(frame, "Kaydet", save, primary=True).grid(
+            row=5, column=0, columnspan=2, sticky="ew", pady=(15, 0)
+        )
+
+    def _student_details(self, student: dict) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"{student['name']} {student['surname']} - Öğrenci bilgisi")
+        dialog.geometry("650x420")
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=24)
+        frame.pack(fill="both", expand=True)
+        average = calculate_average(student)
+        ttk.Label(
+            frame, text=f"{student['name']} {student['surname']}",
+            font=("Segoe UI", 20, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            frame,
+            text=f"Sınıf: {student['class']}     Genel ortalama: {average:g}     "
+            f"Durum: {'Başarılı' if student['passed'] else 'Başarısız'}",
+            style="Subheading.TLabel",
+        ).pack(anchor="w", pady=(5, 18))
+        table = ttk.Treeview(
+            frame, columns=("lesson", "exam1", "exam2", "oral", "average"),
+            show="headings", height=8,
+        )
+        for col, label in (
+            ("lesson", "Ders"), ("exam1", "1. Sınav"), ("exam2", "2. Sınav"),
+            ("oral", "Sözlü"), ("average", "Ortalama"),
+        ):
+            table.heading(col, text=label)
+            table.column(col, anchor="center", width=110)
+        for lesson in student["lessons"]:
+            table.insert(
+                "", "end",
+                values=(lesson["name"], lesson["exam1"], lesson["exam2"],
+                        lesson["oral"], lesson["average"]),
+            )
+        table.pack(fill="both", expand=True)
+
+    def _show_statistics(self) -> None:
+        self._heading("İstatistikler", "Sınıf genelindeki başarı ölçümleri")
+        if not self.students:
+            ttk.Label(self.content, text="İstatistik için öğrenci kaydı bulunmuyor.",
+                      style="Subheading.TLabel").pack(anchor="w")
+            return
+
+        for student in self.students:
+            calculate_average(student)
+        total = len(self.students)
+        passed = [item for item in self.students if item["passed"]]
+        average = sum(item["average"] for item in self.students) / total
+        highest = max(self.students, key=lambda item: item["average"])
+        lowest = min(self.students, key=lambda item: item["average"])
+
+        stats = ttk.Frame(self.content)
+        stats.pack(fill="x", pady=(0, 24))
+        for title, value in (
+            ("Öğrenci sayısı", str(total)),
+            ("Başarılı", str(len(passed))),
+            ("Başarısız", str(total - len(passed))),
+            ("Sınıf ortalaması", f"{average:.2f}"),
+        ):
+            card = ttk.Frame(stats, style="Card.TFrame", padding=18)
+            card.pack(side="left", fill="both", expand=True, padx=(0, 12))
+            ttk.Label(card, text=title, style="CardTitle.TLabel").pack(anchor="w")
+            ttk.Label(card, text=value, style="CardValue.TLabel").pack(anchor="w", pady=(8, 0))
+
+        ttk.Label(self.content, text="En yüksek öğrenci ortalaması",
+                  font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(5, 4))
+        ttk.Label(
+            self.content,
+            text=f"{highest['name']} {highest['surname']}  ·  {highest['average']:g}",
+            style="Subheading.TLabel",
+        ).pack(anchor="w", pady=(0, 18))
+        ttk.Label(self.content, text="En düşük öğrenci ortalaması",
+                  font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(5, 4))
+        ttk.Label(
+            self.content,
+            text=f"{lowest['name']} {lowest['surname']}  ·  {lowest['average']:g}",
+            style="Subheading.TLabel",
+        ).pack(anchor="w", pady=(0, 18))
+
+        lesson_scores: dict[str, list[float]] = {}
+        for student in self.students:
+            for lesson in student["lessons"]:
+                lesson_scores.setdefault(lesson["name"], []).append(lesson["average"])
+        if lesson_scores:
+            lesson_averages = {
+                name: sum(scores) / len(scores) for name, scores in lesson_scores.items()
+            }
+            best = max(lesson_averages, key=lesson_averages.get)
+            lowest_lesson = min(lesson_averages, key=lesson_averages.get)
+            ttk.Label(
+                self.content,
+                text=f"En başarılı ders: {best} ({lesson_averages[best]:.1f})",
+                font=("Segoe UI", 11),
+            ).pack(anchor="w", pady=4)
+            ttk.Label(
+                self.content,
+                text=f"En düşük ders ortalaması: {lowest_lesson} "
+                f"({lesson_averages[lowest_lesson]:.1f})",
+                font=("Segoe UI", 11),
+            ).pack(anchor="w", pady=4)
+
+
+def main() -> None:
+    root = tk.Tk()
+    try:
+        StudentTrackerWindow(root)
+    except (OSError, ValueError) as error:
+        messagebox.showerror("Veri yükleme hatası", str(error), parent=root)
+        root.destroy()
+        return
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
