@@ -1,2 +1,5 @@
 # python-projelerim
-python öğrenirken en basitten ileriye yaptığım kodler ve programlar
+python öğrenirken en basitten ileriye yaptığım kodler ve programları bir araya getiriyorum
+
+
+
