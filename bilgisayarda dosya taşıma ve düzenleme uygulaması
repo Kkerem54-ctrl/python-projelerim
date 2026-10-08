@@ -1,0 +1,340 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable
+
+
+DEFAULT_RULES_PATH = Path(__file__).with_name("kural.json")
+
+
+@dataclass(frozen=True)
+class PlannedMove:
+    source: Path
+    target: Path
+    category: str
+
+
+def load_rules(rules_path: Path) -> dict[str, tuple[str, ...]]:
+    """Load and validate extension-to-category rules from a JSON file."""
+    try:
+        raw_rules = json.loads(rules_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"Kural dosyası okunamadı: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Kural dosyası geçerli JSON değil: {exc}") from exc
+
+    if not isinstance(raw_rules, dict) or not raw_rules:
+        raise ValueError("Kural dosyasının en üst seviyesi boş olmayan bir JSON nesnesi olmalı.")
+
+    rules: dict[str, tuple[str, ...]] = {}
+    used_extensions: set[str] = set()
+    for category, extensions in raw_rules.items():
+        if not isinstance(category, str) or not category.strip():
+            raise ValueError("Kategori adları boş olmayan metinler olmalı.")
+        if (
+            category in {".", ".."}
+            or Path(category).name != category
+            or any(character in category for character in '<>:"/\\|?*')
+            or category.endswith((" ", "."))
+            or category.split(".", maxsplit=1)[0].casefold()
+            in {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+        ):
+            raise ValueError(f"'{category}' geçerli ve güvenli bir klasör adı değil.")
+        if category.casefold() == "diger":
+            raise ValueError("'diger' kategori adı ayrılmamış dosyalar için kullanılıyor.")
+        if not isinstance(extensions, list):
+            raise ValueError(f"'{category}' kategorisinin uzantıları bir liste olmalı.")
+
+        normalized_extensions: list[str] = []
+        for extension in extensions:
+            if (
+                not isinstance(extension, str)
+                or len(extension) < 2
+                or not extension.startswith(".")
+                or any(separator in extension for separator in ("/", "\\"))
+            ):
+                raise ValueError(
+                    f"'{category}' kategorisindeki uzantılar nokta ile başlamalı "
+                    "ve örneğin '.pdf' biçiminde olmalı."
+                )
+            normalized = extension.casefold()
+            if normalized in used_extensions:
+                raise ValueError(f"'{extension}' uzantısı birden fazla kategoride tanımlanmış.")
+            used_extensions.add(normalized)
+            normalized_extensions.append(normalized)
+        rules[category] = tuple(normalized_extensions)
+
+    return rules
+
+
+def _unique_target(target_dir: Path, filename: str, reserved: set[str]) -> Path:
+    """Return a target name not already on disk or reserved by this plan."""
+    candidate = target_dir / filename
+    stem, suffix = candidate.stem, candidate.suffix
+    counter = 1
+    while os.path.lexists(candidate) or candidate.name.casefold() in reserved:
+        candidate = target_dir / f"{stem}_{counter}{suffix}"
+        counter += 1
+    reserved.add(candidate.name.casefold())
+    return candidate
+
+
+def plan_moves(source_dir: Path, destination_dir: Path, rules: dict[str, tuple[str, ...]]) -> list[PlannedMove]:
+    """Plan moves for regular files directly inside source_dir (not subfolders)."""
+    if not source_dir.is_dir() or not destination_dir.is_dir():
+        raise ValueError("Kaynak ve hedef mevcut klasörler olmalı.")
+    if source_dir.resolve() == destination_dir.resolve():
+        raise ValueError("Kaynak ve hedef klasör aynı olamaz.")
+
+    for category in rules:
+        category_path = destination_dir / category
+        if os.path.lexists(category_path) and not category_path.is_dir():
+            raise ValueError(f"'{category_path}' kategori klasörünün yerinde bir dosya var.")
+
+    moves: list[PlannedMove] = []
+    reserved_by_category: dict[str, set[str]] = {}
+    for source in sorted(source_dir.iterdir(), key=lambda item: item.name.casefold()):
+        if not source.is_file() or source.is_symlink():
+            continue
+
+        extension = source.suffix.casefold()
+        category = next(
+            (name for name, extensions in rules.items() if extension in extensions),
+            "diger",
+        )
+        target_dir = destination_dir / category
+        reserved = reserved_by_category.setdefault(category.casefold(), set())
+        target = _unique_target(target_dir, source.name, reserved)
+        moves.append(PlannedMove(source=source, target=target, category=category))
+    return moves
+
+
+def _make_logger(log_path: Path) -> logging.Logger:
+    logger = logging.Logger(f"organizer.{id(log_path)}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+def _available_log_path(directory: Path, filename: str) -> Path:
+    requested = directory / filename
+    stem, suffix = requested.stem, requested.suffix
+    candidate = requested
+    counter = 1
+    while os.path.lexists(candidate):
+        candidate = directory / f"{stem}_{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+def _ask_directory(
+    question: str,
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+    *,
+    must_exist: bool = True,
+) -> Path:
+    while True:
+        entered = input_fn(question).strip().strip('"').strip("'")
+        if not entered:
+            output_fn("Klasör yolu boş bırakılamaz.")
+            continue
+        path = Path(entered).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+        if must_exist and not path.is_dir():
+            output_fn("Bu klasör bulunamadı. Geçerli bir klasör yolu girin.")
+            continue
+        return path
+
+
+def _ask_rules(
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+) -> tuple[Path, dict[str, tuple[str, ...]]]:
+    while True:
+        entered = input_fn(
+            f"Kural dosyası [{DEFAULT_RULES_PATH}] (Enter varsayılanı kullanır): "
+        ).strip().strip('"').strip("'")
+        path = Path(entered).expanduser() if entered else DEFAULT_RULES_PATH
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+        try:
+            return path, load_rules(path)
+        except ValueError as exc:
+            output_fn(str(exc))
+            output_fn("Lütfen geçerli bir kural dosyası yolu girin.")
+
+
+def _ask_yes_no(
+    question: str,
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+) -> bool:
+    while True:
+        answer = input_fn(question).strip().casefold()
+        if answer in {"e", "evet"}:
+            return True
+        if answer in {"h", "hayır", "hayir"}:
+            return False
+        output_fn("Lütfen 'e' (evet) veya 'h' (hayır) girin.")
+
+
+def _ask_mode(input_fn: Callable[[str], str], output_fn: Callable[[str], None]) -> int:
+    while True:
+        output_fn(
+            "\nÇalışma seçenekleri:\n"
+            "  1 - Sadece dry-run yap ve raporu logla (dosya taşınmaz)\n"
+            "  2 - Önizle, onay al, taşı ve otomatik logla\n"
+            "  3 - Önizle, onay al, taşı ve log dosyasının adını seç\n"
+            "  4 - Önizle, onay al, her dosyayı ayrıca sorarak taşı ve logla\n"
+            "  5 - Çıkış"
+        )
+        answer = input_fn("Nasıl çalışsın? (1-5): ").strip()
+        if answer in {"1", "2", "3", "4", "5"}:
+            return int(answer)
+        output_fn("Geçersiz seçim. 1 ile 5 arasında bir seçenek girin.")
+
+
+def _ask_custom_log_name(
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+) -> str:
+    while True:
+        name = input_fn("Hedef klasörde oluşturulacak log dosyasının adı: ").strip()
+        if not name:
+            output_fn("Log dosyasının adı boş bırakılamaz.")
+            continue
+        if Path(name).name != name or name in {".", ".."}:
+            output_fn("Yalnızca dosya adı girin; klasör yolu kullanmayın.")
+            continue
+        if not name.casefold().endswith(".log"):
+            name += ".log"
+        return name
+
+
+def run_app(
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
+) -> None:
+    output_fn("=== İndirilenler Klasörü Düzenleyici ===")
+    source_dir = _ask_directory("Hangi klasörü düzenlemek istiyorsun? ", input_fn, output_fn)
+    destination_dir = _ask_directory("Dosyaları nereye taşıyalım? ", input_fn, output_fn)
+    while source_dir == destination_dir:
+        output_fn("Kaynak ve hedef klasör aynı olamaz.")
+        destination_dir = _ask_directory(
+            "Dosyaları nereye taşıyalım? ", input_fn, output_fn
+        )
+    rules_path, rules = _ask_rules(input_fn, output_fn)
+    output_fn(f"Kullanılan kurallar: {rules_path}")
+
+    mode = _ask_mode(input_fn, output_fn)
+    if mode == 5:
+        output_fn("Programdan çıkılıyor.")
+        return
+
+    custom_log_name = _ask_custom_log_name(input_fn, output_fn) if mode == 3 else None
+    try:
+        moves = plan_moves(source_dir, destination_dir, rules)
+    except (OSError, ValueError) as exc:
+        output_fn(f"İşlem planı oluşturulamadı: {exc}")
+        return
+
+    output_fn("\nÖnizleme (dry-run):")
+    if not moves:
+        output_fn("Taşınacak dosya bulunamadı.")
+    for move in moves:
+        output_fn(f"  {move.source.name} -> {move.category}\\{move.target.name}")
+
+    if custom_log_name:
+        log_path = _available_log_path(destination_dir, custom_log_name)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = _available_log_path(destination_dir, f"duzenleme_{timestamp}.log")
+
+    try:
+        logger = _make_logger(log_path)
+    except OSError as exc:
+        output_fn(f"Log dosyası oluşturulamadı: {exc}")
+        return
+
+    try:
+        logger.info("İşlem başladı. Kaynak: %s | Hedef: %s", source_dir, destination_dir)
+        logger.info("Kural dosyası: %s", rules_path)
+        for move in moves:
+            logger.info("Önizleme: %s -> %s", move.source, move.target)
+        output_fn(f"Log dosyası: {log_path}")
+
+        if mode == 1:
+            logger.info("Dry-run tamamlandı; dosyalar taşınmadı.")
+            output_fn("Dry-run tamamlandı. Hiçbir dosya taşınmadı.")
+            return
+
+        if not moves:
+            logger.info("Taşınacak dosya bulunmadığı için işlem tamamlandı.")
+            return
+
+        if not _ask_yes_no(
+            f"{len(moves)} dosya taşınacak. Devam etmek istiyor musun? (e/h): ",
+            input_fn,
+            output_fn,
+        ):
+            logger.info("Kullanıcı işlemi iptal etti; dosyalar taşınmadı.")
+            output_fn("İşlem iptal edildi. Dosyalar taşınmadı.")
+            return
+
+        moved_count = 0
+        skipped_count = 0
+        for move in moves:
+            if mode == 4 and not _ask_yes_no(
+                f"'{move.source.name}' dosyası taşınsın mı? (e/h): ",
+                input_fn,
+                output_fn,
+            ):
+                logger.info("Atlandı: %s", move.source)
+                skipped_count += 1
+                continue
+
+            try:
+                move.target.parent.mkdir(parents=True, exist_ok=True)
+                target = move.target
+                if os.path.lexists(target):
+                    target = _unique_target(target.parent, move.source.name, set())
+                shutil.move(str(move.source), str(target))
+            except OSError as exc:
+                logger.exception("Hata: %s taşınamadı: %s", move.source, exc)
+                output_fn(f"Hata: '{move.source.name}' taşınamadı: {exc}")
+                continue
+
+            logger.info("Taşındı: %s -> %s", move.source, target)
+            output_fn(f"Taşındı: {move.source.name} -> {move.category}\\{target.name}")
+            moved_count += 1
+
+        logger.info(
+            "İşlem tamamlandı. Taşınan: %d | Atlanan: %d",
+            moved_count,
+            skipped_count,
+        )
+        output_fn(
+            f"İşlem tamamlandı. Taşınan: {moved_count}, atlanan: {skipped_count}. "
+            f"Log: {log_path}"
+        )
+    finally:
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+
+
+if __name__ == "__main__":
+    run_app()
