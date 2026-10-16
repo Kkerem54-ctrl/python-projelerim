@@ -1,0 +1,947 @@
+"""Tkinter tabanlı Stok ve Hızlı Satış uygulaması.
+
+Yalnızca Python standart kütüphanesini kullanır. Veriler uygulama klasöründeki
+stok_satis.db SQLite dosyasında saklanır.
+"""
+
+from __future__ import annotations
+
+import csv
+import math
+import sqlite3
+import tkinter as tk
+from datetime import date, datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = APP_DIR / "stok_satis.db"
+BG = "#f3f6fa"
+NAVY = "#132238"
+GREEN = "#13a882"
+TEXT = "#203047"
+MUTED = "#718096"
+WHITE = "#ffffff"
+RED = "#d9485f"
+
+
+def money(value: float) -> str:
+    return f"₺{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def quantity(value: float) -> str:
+    return f"{value:g}".replace(".", ",")
+
+
+def parse_number(value: str, label: str, *, allow_zero: bool = True) -> float:
+    normalized = value.strip().replace("₺", "").replace(" ", "")
+    if "," in normalized and "." in normalized:
+        normalized = normalized.replace(".", "").replace(",", ".")
+    else:
+        normalized = normalized.replace(",", ".")
+    try:
+        number = float(normalized)
+    except ValueError as exc:
+        raise ValueError(f"{label} geçerli bir sayı olmalıdır.") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{label} geçerli bir sayı olmalıdır.")
+    if number < 0 or (not allow_zero and number == 0):
+        condition = "0'dan büyük" if not allow_zero else "0 veya daha büyük"
+        raise ValueError(f"{label} {condition} olmalıdır.")
+    return number
+
+
+class Database:
+    """SQLite veri erişim katmanı ve stok/satış işlemleri."""
+
+    def __init__(self, path: Path):
+        self.connection = sqlite3.connect(path)
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        self._create_schema()
+        self._seed_if_empty()
+
+    def _create_schema(self) -> None:
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                barcode TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'Genel',
+                unit TEXT NOT NULL DEFAULT 'Adet',
+                price REAL NOT NULL CHECK(price >= 0),
+                cost REAL NOT NULL DEFAULT 0 CHECK(cost >= 0),
+                stock REAL NOT NULL DEFAULT 0 CHECK(stock >= 0),
+                min_stock REAL NOT NULL DEFAULT 0 CHECK(min_stock >= 0),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sold_at TEXT NOT NULL,
+                total REAL NOT NULL,
+                payment_method TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sale_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sale_id INTEGER NOT NULL REFERENCES sales(id),
+                product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+                product_name TEXT NOT NULL,
+                barcode TEXT NOT NULL,
+                qty REAL NOT NULL CHECK(qty > 0),
+                unit_price REAL NOT NULL,
+                line_total REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS stock_movements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+                moved_at TEXT NOT NULL,
+                movement_type TEXT NOT NULL,
+                qty REAL NOT NULL CHECK(qty > 0),
+                note TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_sales_sold_at ON sales(sold_at);
+            CREATE INDEX IF NOT EXISTS idx_movements_moved_at ON stock_movements(moved_at);
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
+        self.connection.commit()
+
+    def _seed_if_empty(self) -> None:
+        already_seeded = self.connection.execute(
+            "SELECT 1 FROM app_meta WHERE key='sample_data_seeded'"
+        ).fetchone()
+        if already_seeded:
+            return
+        examples = [
+            ("8690000000011", "Domates", "Sebze", "Kg", 34.90, 22.00, 28, 5),
+            ("8690000000012", "Salatalık", "Sebze", "Kg", 29.90, 18.00, 20, 4),
+            ("8690000000013", "Elma", "Meyve", "Kg", 42.50, 28.00, 16, 4),
+            ("8690000000014", "Limon", "Meyve", "Kg", 39.90, 25.00, 12, 3),
+            ("8690000000015", "Patates", "Sebze", "Kg", 19.90, 12.00, 35, 6),
+            ("8690000000016", "Süt 1 L", "Süt Ürünleri", "Adet", 32.00, 23.00, 18, 5),
+            ("8690000000017", "Yumurta 10'lu", "Süt Ürünleri", "Paket", 74.90, 56.00, 10, 3),
+            ("8690000000018", "Somun Ekmek", "Fırın", "Adet", 12.50, 8.00, 24, 5),
+            ("8690000000019", "Mandalina", "Meyve", "Kg", 36.90, 24.00, 3, 4),
+            ("8690000000020", "Zeytin 500 g", "Kahvaltılık", "Paket", 89.00, 66.00, 8, 2),
+            ("8690000000021", "Pirinç 1 kg", "Temel Gıda", "Paket", 54.90, 42.00, 15, 4),
+            ("8690000000022", "Soğan", "Sebze", "Kg", 17.90, 10.00, 2, 4),
+        ]
+        self.connection.executemany(
+            """INSERT INTO products(barcode,name,category,unit,price,cost,stock,min_stock)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            examples,
+        )
+        self.connection.execute("INSERT INTO app_meta(key,value) VALUES('sample_data_seeded','1')")
+        self.connection.commit()
+
+    def products(self, search: str = "", category: str = "Tümü") -> list[sqlite3.Row]:
+        query = "SELECT * FROM products WHERE (name LIKE ? OR barcode LIKE ?)"
+        args: list[object] = [f"%{search}%", f"%{search}%"]
+        if category and category != "Tümü":
+            query += " AND category=?"
+            args.append(category)
+        return list(self.connection.execute(query + " ORDER BY name COLLATE NOCASE", args))
+
+    def categories(self) -> list[str]:
+        return [row[0] for row in self.connection.execute(
+            "SELECT DISTINCT category FROM products ORDER BY category COLLATE NOCASE"
+        )]
+
+    def product(self, product_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+
+    def save_product(self, values: dict[str, object], product_id: int | None = None) -> None:
+        cursor = self.connection.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            if product_id is None:
+                cursor.execute(
+                    """INSERT INTO products(barcode,name,category,unit,price,cost,stock,min_stock)
+                       VALUES(:barcode,:name,:category,:unit,:price,:cost,:stock,:min_stock)""", values
+                )
+                new_id = cursor.lastrowid
+                if float(values["stock"]) > 0:
+                    cursor.execute(
+                        """INSERT INTO stock_movements(product_id,moved_at,movement_type,qty,note)
+                           VALUES(?,?,?,?,?)""",
+                        (new_id, datetime.now().isoformat(timespec="seconds"), "Giriş",
+                         float(values["stock"]), "Açılış stoğu"),
+                    )
+            else:
+                cursor.execute(
+                    """UPDATE products SET barcode=:barcode,name=:name,category=:category,unit=:unit,
+                       price=:price,cost=:cost,min_stock=:min_stock WHERE id=:id""",
+                    {**values, "id": product_id},
+                )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def delete_product(self, product_id: int) -> None:
+        self.connection.execute("DELETE FROM products WHERE id=?", (product_id,))
+        self.connection.commit()
+
+    def change_stock(self, product_id: int, movement_type: str, qty: float, note: str) -> None:
+        if qty <= 0:
+            raise ValueError("Stok miktarı 0'dan büyük olmalıdır.")
+        cursor = self.connection.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            row = cursor.execute("SELECT stock FROM products WHERE id=?", (product_id,)).fetchone()
+            if not row:
+                raise ValueError("Ürün bulunamadı.")
+            new_stock = row[0] + qty if movement_type == "Giriş" else row[0] - qty
+            if new_stock < 0:
+                raise ValueError("Stok miktarı mevcut stoktan fazla olamaz.")
+            cursor.execute("UPDATE products SET stock=? WHERE id=?", (new_stock, product_id))
+            cursor.execute(
+                "INSERT INTO stock_movements(product_id,moved_at,movement_type,qty,note) VALUES(?,?,?,?,?)",
+                (product_id, datetime.now().isoformat(timespec="seconds"), movement_type, qty, note),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def complete_sale(self, cart: dict[int, float], payment_method: str) -> tuple[int, float]:
+        if not cart:
+            raise ValueError("Sepet boş. Önce satışa ürün ekleyin.")
+        cursor = self.connection.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            items: list[tuple[sqlite3.Row, float, float]] = []
+            total = 0.0
+            for product_id, qty in cart.items():
+                if qty <= 0:
+                    raise ValueError("Ürün miktarı 0'dan büyük olmalıdır.")
+                product = cursor.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+                if product is None:
+                    raise ValueError("Sepetteki ürün artık bulunamıyor.")
+                if product["stock"] < qty:
+                    raise ValueError(f"{product['name']} için stok yetersiz. Mevcut: {quantity(product['stock'])} {product['unit']}.")
+                line_total = round(product["price"] * qty, 2)
+                items.append((product, qty, line_total))
+                total += line_total
+            sold_at = datetime.now().isoformat(timespec="seconds")
+            cursor.execute("INSERT INTO sales(sold_at,total,payment_method) VALUES(?,?,?)",
+                           (sold_at, round(total, 2), payment_method))
+            sale_id = cursor.lastrowid
+            for product, qty, line_total in items:
+                cursor.execute(
+                    """INSERT INTO sale_items(sale_id,product_id,product_name,barcode,qty,unit_price,line_total)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (sale_id, product["id"], product["name"], product["barcode"], qty,
+                     product["price"], line_total),
+                )
+                cursor.execute("UPDATE products SET stock=stock-? WHERE id=?", (qty, product["id"]))
+                cursor.execute(
+                    """INSERT INTO stock_movements(product_id,moved_at,movement_type,qty,note)
+                       VALUES(?,?,?,?,?)""",
+                    (product["id"], sold_at, "Satış", qty, f"Satış #{sale_id}"),
+                )
+            self.connection.commit()
+            return int(sale_id), round(total, 2)
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def summary(self) -> dict[str, float | int]:
+        products = self.connection.execute(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(stock*cost),0) AS value FROM products"
+        ).fetchone()
+        sales = self.connection.execute(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(total),0) AS total FROM sales WHERE date(sold_at)=date('now','localtime')"
+        ).fetchone()
+        low = self.connection.execute("SELECT COUNT(*) FROM products WHERE stock<=min_stock").fetchone()[0]
+        return {"products": products["count"], "stock_value": products["value"],
+                "sales_count": sales["count"], "sales_total": sales["total"], "low_stock": low}
+
+    def recent_sales(self, limit: int = 8) -> list[sqlite3.Row]:
+        return list(self.connection.execute("SELECT * FROM sales ORDER BY id DESC LIMIT ?", (limit,)))
+
+    def low_stock_products(self) -> list[sqlite3.Row]:
+        return list(self.connection.execute(
+            "SELECT * FROM products WHERE stock<=min_stock ORDER BY stock ASC,name COLLATE NOCASE"
+        ))
+
+    def movements(self, limit: int = 500) -> list[sqlite3.Row]:
+        return list(self.connection.execute(
+            """SELECT m.*,p.name,p.barcode,p.unit FROM stock_movements m
+               JOIN products p ON p.id=m.product_id ORDER BY m.id DESC LIMIT ?""", (limit,)
+        ))
+
+    def report(self, start: str, end: str) -> tuple[list[sqlite3.Row], list[sqlite3.Row], float]:
+        sales = list(self.connection.execute(
+            "SELECT * FROM sales WHERE date(sold_at) BETWEEN date(?) AND date(?) ORDER BY sold_at DESC",
+            (start, end),
+        ))
+        top_products = list(self.connection.execute(
+            """SELECT product_name,SUM(qty) AS qty,SUM(line_total) AS total
+               FROM sale_items JOIN sales ON sales.id=sale_items.sale_id
+               WHERE date(sales.sold_at) BETWEEN date(?) AND date(?)
+               GROUP BY product_name ORDER BY total DESC LIMIT 10""", (start, end)
+        ))
+        return sales, top_products, round(sum(row["total"] for row in sales), 2)
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+class ProductDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, db: Database, product: sqlite3.Row | None = None):
+        super().__init__(parent)
+        self.db = db
+        self.product = product
+        self.result = False
+        self.title("Ürünü Düzenle" if product else "Yeni Ürün")
+        self.configure(bg=WHITE)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.vars = {key: tk.StringVar(value="") for key in
+                     ("barcode", "name", "category", "unit", "price", "cost", "stock", "min_stock")}
+        if product:
+            for key in self.vars:
+                self.vars[key].set(str(product[key]))
+        else:
+            self.vars["category"].set("Genel")
+            self.vars["unit"].set("Adet")
+            self.vars["stock"].set("0")
+            self.vars["min_stock"].set("0")
+        self._build()
+        self.wait_visibility()
+        self.focus_force()
+
+    def _build(self) -> None:
+        body = ttk.Frame(self, padding=22)
+        body.grid(sticky="nsew")
+        ttk.Label(body, text="Ürün bilgileri", style="DialogTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 16))
+        fields = [("Barkod *", "barcode", None), ("Ürün adı *", "name", None),
+                  ("Kategori", "category", None), ("Birim", "unit", ["Adet", "Kg", "Litre", "Paket", "Kutu"]),
+                  ("Satış fiyatı (₺) *", "price", None), ("Alış maliyeti (₺)", "cost", None),
+                  ("Mevcut stok (stok hareketiyle değişir)", "stock", None), ("Kritik stok seviyesi", "min_stock", None)]
+        for i, (label, key, choices) in enumerate(fields, start=1):
+            ttk.Label(body, text=label).grid(row=i, column=0, sticky="w", pady=5, padx=(0, 14))
+            if choices:
+                widget = ttk.Combobox(body, textvariable=self.vars[key], values=choices, state="readonly", width=28)
+            else:
+                widget = ttk.Entry(body, textvariable=self.vars[key], width=31)
+                if key == "stock" and self.product is not None:
+                    widget.configure(state="disabled")
+            widget.grid(row=i, column=1, sticky="ew", pady=5)
+        buttons = ttk.Frame(body)
+        buttons.grid(row=9, column=0, columnspan=2, sticky="e", pady=(16, 0))
+        ttk.Button(buttons, text="Vazgeç", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(buttons, text="Kaydet", style="Accent.TButton", command=self._save).pack(side="right")
+
+    def _save(self) -> None:
+        values = {key: variable.get().strip() for key, variable in self.vars.items()}
+        if not values["barcode"] or not values["name"]:
+            messagebox.showerror("Eksik bilgi", "Barkod ve ürün adı zorunludur.", parent=self)
+            return
+        try:
+            values["price"] = parse_number(str(values["price"]), "Satış fiyatı")
+            values["cost"] = parse_number(str(values["cost"] or "0"), "Alış maliyeti")
+            values["stock"] = parse_number(str(values["stock"] or "0"), "Stok")
+            values["min_stock"] = parse_number(str(values["min_stock"] or "0"), "Kritik stok seviyesi")
+            values["category"] = values["category"] or "Genel"
+            values["unit"] = values["unit"] or "Adet"
+            self.db.save_product(values, self.product["id"] if self.product else None)
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            message = "Bu barkod başka bir üründe kullanılıyor." if isinstance(exc, sqlite3.IntegrityError) else str(exc)
+            messagebox.showerror("Ürün kaydedilemedi", message, parent=self)
+            return
+        self.result = True
+        self.destroy()
+
+
+class StockDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, db: Database, product: sqlite3.Row):
+        super().__init__(parent)
+        self.db = db
+        self.product = product
+        self.result = False
+        self.title("Stok Hareketi")
+        self.configure(bg=WHITE)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        body = ttk.Frame(self, padding=22)
+        body.grid(sticky="nsew")
+        ttk.Label(body, text=product["name"], style="DialogTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 5))
+        ttk.Label(body, text=f"Mevcut stok: {quantity(product['stock'])} {product['unit']}", style="Muted.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        ttk.Label(body, text="Hareket türü").grid(row=2, column=0, sticky="w", pady=5)
+        self.kind = tk.StringVar(value="Giriş")
+        ttk.Combobox(body, textvariable=self.kind, values=["Giriş", "Çıkış"], state="readonly", width=25).grid(row=2, column=1, pady=5)
+        ttk.Label(body, text="Miktar").grid(row=3, column=0, sticky="w", pady=5)
+        self.qty = tk.StringVar(value="1")
+        ttk.Entry(body, textvariable=self.qty, width=28).grid(row=3, column=1, pady=5)
+        ttk.Label(body, text="Açıklama").grid(row=4, column=0, sticky="w", pady=5)
+        self.note = tk.StringVar()
+        ttk.Entry(body, textvariable=self.note, width=28).grid(row=4, column=1, pady=5)
+        buttons = ttk.Frame(body)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(buttons, text="Vazgeç", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(buttons, text="Uygula", style="Accent.TButton", command=self._apply).pack(side="right")
+
+    def _apply(self) -> None:
+        try:
+            qty = parse_number(self.qty.get(), "Miktar", allow_zero=False)
+            self.db.change_stock(self.product["id"], self.kind.get(), qty, self.note.get().strip())
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Stok güncellenemedi", str(exc), parent=self)
+            return
+        self.result = True
+        self.destroy()
+
+
+class InventoryApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.db = Database(DB_PATH)
+        self.cart: dict[int, float] = {}
+        self.cart_tree: ttk.Treeview | None = None
+        self.product_tree: ttk.Treeview | None = None
+        self.movement_tree: ttk.Treeview | None = None
+        self.report_sales_tree: ttk.Treeview | None = None
+        self.report_items_tree: ttk.Treeview | None = None
+        self.root.title("MaviKasa | Stok ve Ürün Yönetimi")
+        self.root.geometry("1380x860")
+        self.root.minsize(1120, 720)
+        self.root.configure(bg=BG)
+        self._style()
+        self._build_shell()
+        self.refresh_all()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _style(self) -> None:
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TFrame", background=BG)
+        style.configure("White.TFrame", background=WHITE)
+        style.configure("TLabel", background=BG, foreground=TEXT, font=("Segoe UI", 10))
+        style.configure("Muted.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("DialogTitle.TLabel", background=WHITE, foreground=NAVY, font=("Segoe UI", 15, "bold"))
+        style.configure("TButton", font=("Segoe UI", 10), padding=(11, 8))
+        style.configure("Accent.TButton", background=GREEN, foreground=WHITE, borderwidth=0, font=("Segoe UI", 10, "bold"))
+        style.map("Accent.TButton", background=[("active", "#0d8f70")])
+        style.configure("Danger.TButton", background="#fff0f1", foreground=RED, borderwidth=0)
+        style.configure("Treeview", background=WHITE, fieldbackground=WHITE, foreground=TEXT,
+                        rowheight=32, font=("Segoe UI", 9), borderwidth=0)
+        style.configure("Treeview.Heading", background="#edf2f7", foreground="#536477",
+                        font=("Segoe UI", 9, "bold"), relief="flat", padding=7)
+        style.map("Treeview", background=[("selected", "#d9f3ec")], foreground=[("selected", NAVY)])
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background="#e7edf4", foreground="#526378",
+                        padding=(18, 11), font=("Segoe UI", 10, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", WHITE)], foreground=[("selected", GREEN)])
+        style.configure("TEntry", padding=7)
+        style.configure("TCombobox", padding=6)
+
+    def _build_shell(self) -> None:
+        header = tk.Frame(self.root, bg=NAVY, height=82)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        brand = tk.Frame(header, bg=NAVY)
+        brand.pack(side="left", padx=25, pady=13)
+        tk.Label(brand, text="MAVİKASA", bg=NAVY, fg=WHITE, font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        tk.Label(brand, text="Stok ve satış yönetimi", bg=NAVY, fg="#b8c6d8", font=("Segoe UI", 9)).pack(anchor="w")
+        self.header_status = tk.Label(header, text="", bg=NAVY, fg="#c8d5e4", font=("Segoe UI", 10))
+        self.header_status.pack(side="right", padx=25)
+        outer = ttk.Frame(self.root, padding=(18, 14, 18, 14))
+        outer.pack(fill="both", expand=True)
+        self.tabs = ttk.Notebook(outer)
+        self.tabs.pack(fill="both", expand=True)
+        self.dashboard_tab = ttk.Frame(self.tabs, padding=16)
+        self.sale_tab = ttk.Frame(self.tabs, padding=14)
+        self.products_tab = ttk.Frame(self.tabs, padding=16)
+        self.movements_tab = ttk.Frame(self.tabs, padding=16)
+        self.reports_tab = ttk.Frame(self.tabs, padding=16)
+        self.tabs.add(self.dashboard_tab, text="  Genel Bakış  ")
+        self.tabs.add(self.sale_tab, text="  Hızlı Satış  ")
+        self.tabs.add(self.products_tab, text="  Ürünler  ")
+        self.tabs.add(self.movements_tab, text="  Stok Hareketleri  ")
+        self.tabs.add(self.reports_tab, text="  Raporlar  ")
+        self._build_dashboard()
+        self._build_sale()
+        self._build_products()
+        self._build_movements()
+        self._build_reports()
+        self.tabs.select(self.sale_tab)
+        footer = tk.Label(self.root, text="SQLite ile güvenli yerel kayıt  •  Kritik stoklar anlık izlenir",
+                          bg=BG, fg="#8794a5", font=("Segoe UI", 8))
+        footer.pack(side="bottom", pady=(0, 8))
+
+    def _card(self, parent: tk.Misc, title: str, value: str, hint: str, color: str) -> tk.Frame:
+        frame = tk.Frame(parent, bg=WHITE, highlightthickness=1, highlightbackground="#e7edf3")
+        tk.Frame(frame, bg=color, width=5).pack(side="left", fill="y")
+        content = tk.Frame(frame, bg=WHITE, padx=15, pady=12)
+        content.pack(side="left", fill="both", expand=True)
+        tk.Label(content, text=title.upper(), bg=WHITE, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        value_label = tk.Label(content, text=value, bg=WHITE, fg=NAVY, font=("Segoe UI", 20, "bold"))
+        value_label.pack(anchor="w", pady=(5, 1))
+        hint_label = tk.Label(content, text=hint, bg=WHITE, fg=MUTED, font=("Segoe UI", 8))
+        hint_label.pack(anchor="w")
+        frame.value_label = value_label
+        frame.hint_label = hint_label
+        return frame
+
+    def _build_dashboard(self) -> None:
+        ttk.Label(self.dashboard_tab, text="Genel Bakış", font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        ttk.Label(self.dashboard_tab, text="Bugünün satışları ve stok durumunu tek ekranda takip edin.", style="Muted.TLabel").pack(anchor="w", pady=(2, 15))
+        cards = ttk.Frame(self.dashboard_tab)
+        cards.pack(fill="x", pady=(0, 16))
+        self.card_products = self._card(cards, "Ürün çeşidi", "0", "Kayıtlı ürün", "#4485d1")
+        self.card_sales = self._card(cards, "Bugünkü satış", money(0), "0 işlem", GREEN)
+        self.card_value = self._card(cards, "Stok maliyeti", money(0), "Alış maliyetine göre", "#8b6bd6")
+        self.card_low = self._card(cards, "Kritik stok", "0", "Yeniden sipariş gerekebilir", RED)
+        for i, card in enumerate((self.card_products, self.card_sales, self.card_value, self.card_low)):
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0))
+            cards.columnconfigure(i, weight=1, uniform="cards")
+        body = ttk.Frame(self.dashboard_tab)
+        body.pack(fill="both", expand=True)
+        recent = ttk.Frame(body, style="White.TFrame", padding=12)
+        recent.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        ttk.Label(recent, text="Son satışlar", font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 9))
+        self.recent_tree = self._tree(recent, [("id", "Fiş", 70), ("date", "Tarih", 170),
+                                                   ("payment", "Ödeme", 105), ("total", "Tutar", 120)])
+        self.recent_tree.pack(fill="both", expand=True)
+        low = ttk.Frame(body, style="White.TFrame", padding=12)
+        low.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        ttk.Label(low, text="Kritik stok uyarıları", font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 9))
+        self.low_tree = self._tree(low, [("name", "Ürün", 170), ("stock", "Mevcut", 90),
+                                             ("min", "Kritik seviye", 100), ("unit", "Birim", 75)])
+        self.low_tree.pack(fill="both", expand=True)
+        self.low_tree.tag_configure("low", foreground=RED)
+
+    def _build_sale(self) -> None:
+        top = ttk.Frame(self.sale_tab)
+        top.pack(fill="x", pady=(0, 10))
+        ttk.Label(top, text="Hızlı Satış", font=("Segoe UI", 19, "bold")).pack(side="left")
+        self.sale_status = ttk.Label(top, text="Ürüne dokunarak sepete ekleyin", style="Muted.TLabel")
+        self.sale_status.pack(side="right")
+        content = ttk.Frame(self.sale_tab)
+        content.pack(fill="both", expand=True)
+        left = ttk.Frame(content, style="White.TFrame", padding=12)
+        left.pack(side="left", fill="both", expand=False, padx=(0, 10))
+        left.configure(width=490)
+        left.pack_propagate(False)
+        ttk.Label(left, text="Satış sepeti", font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 9))
+        self.cart_tree = self._tree(left, [("barcode", "Barkod", 110), ("name", "Ürün", 145),
+                                               ("qty", "Mik.", 55), ("price", "Fiyat", 75), ("total", "Tutar", 85)])
+        self.cart_tree.pack(fill="both", expand=True)
+        actions = ttk.Frame(left, style="White.TFrame")
+        actions.pack(fill="x", pady=(8, 5))
+        ttk.Button(actions, text="− Miktar", command=lambda: self.adjust_cart(-1)).pack(side="left")
+        ttk.Button(actions, text="+ Miktar", command=lambda: self.adjust_cart(1)).pack(side="left", padx=5)
+        ttk.Button(actions, text="Miktar gir", command=self.set_cart_qty).pack(side="left")
+        ttk.Button(actions, text="Kaldır", style="Danger.TButton", command=self.remove_cart_item).pack(side="right")
+        ttk.Separator(left).pack(fill="x", pady=7)
+        totalrow = ttk.Frame(left, style="White.TFrame")
+        totalrow.pack(fill="x", pady=(0, 8))
+        ttk.Label(totalrow, text="GENEL TOPLAM", style="Muted.TLabel").pack(side="left")
+        self.cart_total_label = ttk.Label(totalrow, text=money(0), font=("Segoe UI", 20, "bold"), foreground=GREEN)
+        self.cart_total_label.pack(side="right")
+        payrow = ttk.Frame(left, style="White.TFrame")
+        payrow.pack(fill="x")
+        ttk.Button(payrow, text="Nakit ile Sat", style="Accent.TButton", command=lambda: self.checkout("Nakit")).pack(side="left", fill="x", expand=True, padx=(0, 5))
+        ttk.Button(payrow, text="Kart ile Sat", command=lambda: self.checkout("Kart")).pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+        right = ttk.Frame(content, style="White.TFrame", padding=12)
+        right.pack(side="left", fill="both", expand=True)
+        searchrow = ttk.Frame(right, style="White.TFrame")
+        searchrow.pack(fill="x", pady=(0, 8))
+        ttk.Label(searchrow, text="Barkod / ürün ara", style="Muted.TLabel").pack(side="left", padx=(0, 8))
+        self.sale_search = tk.StringVar()
+        search_entry = ttk.Entry(searchrow, textvariable=self.sale_search)
+        search_entry.pack(side="left", fill="x", expand=True)
+        search_entry.bind("<Return>", self.scan_or_add_product)
+        self.sale_search.trace_add("write", lambda *_: self.refresh_sale_tiles())
+        ttk.Label(searchrow, text="Kategori", style="Muted.TLabel").pack(side="left", padx=(12, 6))
+        self.category_filter = tk.StringVar(value="Tümü")
+        self.category_combo = ttk.Combobox(searchrow, textvariable=self.category_filter, state="readonly", width=16)
+        self.category_combo.pack(side="left")
+        self.category_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_sale_tiles())
+        tile_container = ttk.Frame(right, style="White.TFrame")
+        tile_container.pack(fill="both", expand=True)
+        self.tile_canvas = tk.Canvas(tile_container, bg=WHITE, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(tile_container, orient="vertical", command=self.tile_canvas.yview)
+        self.tile_frame = tk.Frame(self.tile_canvas, bg=WHITE)
+        self.tile_frame.bind("<Configure>", lambda _e: self.tile_canvas.configure(scrollregion=self.tile_canvas.bbox("all")))
+        self.tile_canvas.create_window((0, 0), window=self.tile_frame, anchor="nw")
+        self.tile_canvas.configure(yscrollcommand=scrollbar.set)
+        self.tile_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.tile_canvas.bind_all("<MouseWheel>", lambda event: self.tile_canvas.yview_scroll(int(-event.delta / 120), "units"))
+
+    def _build_products(self) -> None:
+        toolbar = ttk.Frame(self.products_tab)
+        toolbar.pack(fill="x", pady=(0, 12))
+        ttk.Label(toolbar, text="Ürünler", font=("Segoe UI", 19, "bold")).pack(side="left")
+        self.product_search = tk.StringVar()
+        search = ttk.Entry(toolbar, textvariable=self.product_search, width=28)
+        search.pack(side="left", padx=(18, 7))
+        ttk.Button(toolbar, text="Ara", command=self.refresh_product_tree).pack(side="left")
+        self.product_search.trace_add("write", lambda *_: self.refresh_product_tree())
+        ttk.Button(toolbar, text="+ Yeni Ürün", style="Accent.TButton", command=self.add_product).pack(side="right")
+        btns = ttk.Frame(self.products_tab)
+        btns.pack(fill="x", pady=(0, 10))
+        ttk.Button(btns, text="Düzenle", command=self.edit_product).pack(side="left")
+        ttk.Button(btns, text="Stok Girişi / Çıkışı", command=self.move_stock).pack(side="left", padx=7)
+        ttk.Button(btns, text="Ürünü Sil", style="Danger.TButton", command=self.delete_product).pack(side="left")
+        self.product_tree = self._tree(self.products_tab, [
+            ("barcode", "Barkod", 145), ("name", "Ürün adı", 210), ("category", "Kategori", 135),
+            ("unit", "Birim", 75), ("price", "Satış fiyatı", 110), ("cost", "Maliyet", 105),
+            ("stock", "Stok", 90), ("min", "Kritik seviye", 105)])
+        self.product_tree.pack(fill="both", expand=True)
+        self.product_tree.tag_configure("low", foreground=RED)
+        self.product_tree.bind("<Double-1>", lambda _e: self.edit_product())
+
+    def _build_movements(self) -> None:
+        header = ttk.Frame(self.movements_tab)
+        header.pack(fill="x", pady=(0, 12))
+        ttk.Label(header, text="Stok Hareketleri", font=("Segoe UI", 19, "bold")).pack(side="left")
+        ttk.Button(header, text="Seçili üründe hareket ekle", style="Accent.TButton", command=self.move_stock).pack(side="right")
+        self.movement_tree = self._tree(self.movements_tab, [
+            ("date", "Tarih", 175), ("type", "Hareket", 110), ("barcode", "Barkod", 145),
+            ("name", "Ürün", 230), ("qty", "Miktar", 100), ("note", "Açıklama", 350)])
+        self.movement_tree.pack(fill="both", expand=True)
+        self.movement_tree.tag_configure("in", foreground="#16825f")
+        self.movement_tree.tag_configure("out", foreground=RED)
+
+    def _build_reports(self) -> None:
+        header = ttk.Frame(self.reports_tab)
+        header.pack(fill="x", pady=(0, 12))
+        ttk.Label(header, text="Satış Raporları", font=("Segoe UI", 19, "bold")).pack(side="left")
+        filters = ttk.Frame(self.reports_tab)
+        filters.pack(fill="x", pady=(0, 12))
+        first_day = date.today().replace(day=1).isoformat()
+        self.report_start = tk.StringVar(value=first_day)
+        self.report_end = tk.StringVar(value=date.today().isoformat())
+        ttk.Label(filters, text="Başlangıç (YYYY-AA-GG)").pack(side="left")
+        ttk.Entry(filters, textvariable=self.report_start, width=14).pack(side="left", padx=(7, 14))
+        ttk.Label(filters, text="Bitiş").pack(side="left")
+        ttk.Entry(filters, textvariable=self.report_end, width=14).pack(side="left", padx=7)
+        ttk.Button(filters, text="Raporu Getir", style="Accent.TButton", command=self.refresh_report).pack(side="left", padx=8)
+        ttk.Button(filters, text="CSV Dışa Aktar", command=self.export_report).pack(side="right")
+        self.report_total = ttk.Label(self.reports_tab, text="Dönem satış toplamı: ₺0,00", font=("Segoe UI", 13, "bold"), foreground=GREEN)
+        self.report_total.pack(anchor="w", pady=(0, 10))
+        panes = ttk.Frame(self.reports_tab)
+        panes.pack(fill="both", expand=True)
+        sales_frame = ttk.Frame(panes, style="White.TFrame", padding=10)
+        sales_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        ttk.Label(sales_frame, text="Satışlar", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 8))
+        self.report_sales_tree = self._tree(sales_frame, [("id", "Fiş", 65), ("date", "Tarih", 170),
+                                                            ("payment", "Ödeme", 90), ("total", "Tutar", 110)])
+        self.report_sales_tree.pack(fill="both", expand=True)
+        items_frame = ttk.Frame(panes, style="White.TFrame", padding=10)
+        items_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        ttk.Label(items_frame, text="En çok ciro yapan ürünler", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 8))
+        self.report_items_tree = self._tree(items_frame, [("name", "Ürün", 200), ("qty", "Satılan", 90), ("total", "Ciro", 120)])
+        self.report_items_tree.pack(fill="both", expand=True)
+
+    def _tree(self, parent: tk.Misc, columns: list[tuple[str, str, int]]) -> ttk.Treeview:
+        keys = [column[0] for column in columns]
+        tree = ttk.Treeview(parent, columns=keys, show="headings", selectmode="browse")
+        for key, title, width in columns:
+            tree.heading(key, text=title)
+            tree.column(key, width=width, minwidth=55, anchor="w" if key in ("name", "category", "note", "barcode", "date") else "center", stretch=True)
+        return tree
+
+    @staticmethod
+    def _clear_tree(tree: ttk.Treeview) -> None:
+        tree.delete(*tree.get_children())
+
+    def refresh_all(self) -> None:
+        summary = self.db.summary()
+        self.card_products.value_label.configure(text=str(summary["products"]))
+        self.card_sales.value_label.configure(text=money(float(summary["sales_total"])))
+        self.card_sales.hint_label.configure(text=f"{summary['sales_count']} işlem")
+        self.card_value.value_label.configure(text=money(float(summary["stock_value"])))
+        self.card_low.value_label.configure(text=str(summary["low_stock"]))
+        self.header_status.configure(text=f"{date.today().strftime('%d.%m.%Y')}  •  {summary['products']} ürün")
+        self.refresh_recent()
+        self.refresh_product_tree()
+        self.refresh_low_stock()
+        self.refresh_movements()
+        self.refresh_category_values()
+        self.refresh_sale_tiles()
+        self.refresh_cart()
+        self.refresh_report()
+
+    def refresh_recent(self) -> None:
+        self._clear_tree(self.recent_tree)
+        for row in self.db.recent_sales():
+            shown_date = datetime.fromisoformat(row["sold_at"]).strftime("%d.%m.%Y %H:%M")
+            self.recent_tree.insert("", "end", values=(f"#{row['id']}", shown_date, row["payment_method"], money(row["total"])))
+
+    def refresh_low_stock(self) -> None:
+        self._clear_tree(self.low_tree)
+        for row in self.db.low_stock_products():
+            self.low_tree.insert("", "end", values=(row["name"], quantity(row["stock"]), quantity(row["min_stock"]), row["unit"]), tags=("low",))
+
+    def refresh_product_tree(self) -> None:
+        if self.product_tree is None:
+            return
+        self._clear_tree(self.product_tree)
+        for row in self.db.products(self.product_search.get() if hasattr(self, "product_search") else ""):
+            tags = ("low",) if row["stock"] <= row["min_stock"] else ()
+            self.product_tree.insert("", "end", iid=str(row["id"]), values=(row["barcode"], row["name"], row["category"], row["unit"],
+                                    money(row["price"]), money(row["cost"]), quantity(row["stock"]), quantity(row["min_stock"])), tags=tags)
+
+    def refresh_movements(self) -> None:
+        self._clear_tree(self.movement_tree)
+        for row in self.db.movements():
+            shown_date = datetime.fromisoformat(row["moved_at"]).strftime("%d.%m.%Y %H:%M")
+            tag = "in" if row["movement_type"] == "Giriş" else "out"
+            self.movement_tree.insert("", "end", values=(shown_date, row["movement_type"], row["barcode"], row["name"],
+                                        f"{quantity(row['qty'])} {row['unit']}", row["note"]), tags=(tag,))
+
+    def refresh_category_values(self) -> None:
+        if hasattr(self, "category_combo"):
+            current = self.category_filter.get() or "Tümü"
+            values = ["Tümü", *self.db.categories()]
+            self.category_combo.configure(values=values)
+            self.category_filter.set(current if current in values else "Tümü")
+
+    def refresh_sale_tiles(self) -> None:
+        if not hasattr(self, "tile_frame"):
+            return
+        for child in self.tile_frame.winfo_children():
+            child.destroy()
+        rows = self.db.products(self.sale_search.get() if hasattr(self, "sale_search") else "",
+                                self.category_filter.get() if hasattr(self, "category_filter") else "Tümü")
+        icons = {"Meyve": "🍎", "Sebze": "🥬", "Süt Ürünleri": "🥛", "Fırın": "🥖",
+                 "Kahvaltılık": "🫒", "Temel Gıda": "🌾", "Genel": "🛍️"}
+        for i, row in enumerate(rows):
+            column = i % 4
+            line = i // 4
+            card = tk.Frame(self.tile_frame, bg="#fbfcfe", highlightthickness=1, highlightbackground="#e2eaf1", cursor="hand2")
+            card.grid(row=line, column=column, padx=6, pady=6, sticky="nsew", ipadx=2, ipady=3)
+            self.tile_frame.columnconfigure(column, weight=1, uniform="tiles")
+            icon = icons.get(row["category"], "🧺")
+            title_color = RED if row["stock"] <= row["min_stock"] else TEXT
+            tk.Label(card, text=icon, bg="#fbfcfe", fg=GREEN, font=("Segoe UI Emoji", 24)).pack(pady=(7, 2))
+            tk.Label(card, text=row["name"], bg="#fbfcfe", fg=TEXT, font=("Segoe UI", 9, "bold"),
+                     wraplength=135, height=2).pack(fill="x", padx=5)
+            tk.Label(card, text=money(row["price"]), bg="#fbfcfe", fg=GREEN, font=("Segoe UI", 10, "bold")).pack(pady=(2, 0))
+            tk.Label(card, text=f"Stok {quantity(row['stock'])} {row['unit']}", bg="#fbfcfe", fg=title_color,
+                     font=("Segoe UI", 8)).pack(pady=(0, 7))
+            for widget in card.winfo_children() + [card]:
+                widget.bind("<Button-1>", lambda _event, product_id=row["id"]: self.add_to_cart(product_id))
+
+    def add_to_cart(self, product_id: int) -> None:
+        product = self.db.product(product_id)
+        if product is None:
+            return
+        desired = self.cart.get(product_id, 0) + 1
+        if desired > product["stock"]:
+            messagebox.showwarning("Stok yetersiz", f"{product['name']} için yeterli stok yok.", parent=self.root)
+            return
+        self.cart[product_id] = desired
+        self.refresh_cart()
+
+    def scan_or_add_product(self, _event: tk.Event | None = None) -> str:
+        term = self.sale_search.get().strip()
+        if not term:
+            return "break"
+        matches = self.db.products(term)
+        exact = next((row for row in matches if row["barcode"] == term), None)
+        product = exact or (matches[0] if len(matches) == 1 else None)
+        if product is None:
+            messagebox.showinfo("Ürün bulunamadı", "Barkod veya ürün adını kontrol edin.", parent=self.root)
+            return "break"
+        self.add_to_cart(product["id"])
+        self.sale_search.set("")
+        return "break"
+
+    def _selected_cart_id(self) -> int | None:
+        selection = self.cart_tree.selection() if self.cart_tree else ()
+        return int(selection[0]) if selection else None
+
+    def adjust_cart(self, delta: int) -> None:
+        product_id = self._selected_cart_id()
+        if product_id is None:
+            messagebox.showinfo("Sepet", "Önce sepette bir ürün seçin.", parent=self.root)
+            return
+        product = self.db.product(product_id)
+        new_qty = self.cart[product_id] + delta
+        if new_qty <= 0:
+            self.cart.pop(product_id, None)
+        elif product and new_qty <= product["stock"]:
+            self.cart[product_id] = new_qty
+        else:
+            messagebox.showwarning("Stok yetersiz", "Sepet miktarı mevcut stoğu aşamaz.", parent=self.root)
+        self.refresh_cart()
+
+    def set_cart_qty(self) -> None:
+        product_id = self._selected_cart_id()
+        if product_id is None:
+            messagebox.showinfo("Sepet", "Önce sepette bir ürün seçin.", parent=self.root)
+            return
+        product = self.db.product(product_id)
+        value = simpledialog.askstring("Miktar", f"Miktar ({product['unit']})", initialvalue=quantity(self.cart[product_id]), parent=self.root)
+        if value is None:
+            return
+        try:
+            new_qty = parse_number(value, "Miktar", allow_zero=False)
+        except ValueError as exc:
+            messagebox.showerror("Geçersiz miktar", str(exc), parent=self.root)
+            return
+        if new_qty > product["stock"]:
+            messagebox.showwarning("Stok yetersiz", "Sepet miktarı mevcut stoğu aşamaz.", parent=self.root)
+            return
+        self.cart[product_id] = new_qty
+        self.refresh_cart()
+
+    def remove_cart_item(self) -> None:
+        product_id = self._selected_cart_id()
+        if product_id is None:
+            return
+        self.cart.pop(product_id, None)
+        self.refresh_cart()
+
+    def refresh_cart(self) -> None:
+        if self.cart_tree is None:
+            return
+        self._clear_tree(self.cart_tree)
+        total = 0.0
+        for product_id, qty in self.cart.items():
+            product = self.db.product(product_id)
+            if not product:
+                continue
+            line = round(product["price"] * qty, 2)
+            total += line
+            self.cart_tree.insert("", "end", iid=str(product_id), values=(product["barcode"], product["name"],
+                                 quantity(qty), money(product["price"]), money(line)))
+        self.cart_total_label.configure(text=money(total))
+        if hasattr(self, "sale_status"):
+            self.sale_status.configure(text=f"Sepette {len(self.cart)} ürün çeşidi")
+
+    def checkout(self, payment: str) -> None:
+        try:
+            sale_id, total = self.db.complete_sale(self.cart, payment)
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Satış tamamlanamadı", str(exc), parent=self.root)
+            return
+        self.cart.clear()
+        self.refresh_all()
+        messagebox.showinfo("Satış tamamlandı", f"Fiş #{sale_id}\nÖdeme: {payment}\nToplam: {money(total)}", parent=self.root)
+
+    def _selected_product(self) -> sqlite3.Row | None:
+        selection = self.product_tree.selection() if self.product_tree else ()
+        if not selection:
+            messagebox.showinfo("Ürün seçin", "İşlem yapmak için ürün tablosundan bir ürün seçin.", parent=self.root)
+            return None
+        return self.db.product(int(selection[0]))
+
+    def add_product(self) -> None:
+        dialog = ProductDialog(self.root, self.db)
+        if dialog.result:
+            self.refresh_all()
+
+    def edit_product(self) -> None:
+        product = self._selected_product()
+        if product is None:
+            return
+        dialog = ProductDialog(self.root, self.db, product)
+        if dialog.result:
+            self.refresh_all()
+
+    def delete_product(self) -> None:
+        product = self._selected_product()
+        if product is None:
+            return
+        if not messagebox.askyesno("Ürünü sil", f"{product['name']} ürününü silmek istiyor musunuz?", parent=self.root):
+            return
+        try:
+            self.db.delete_product(product["id"])
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Ürün silinemedi", "Satış veya stok hareketi bulunan ürün, geçmiş kayıtların bütünlüğü için silinemez.", parent=self.root)
+            return
+        self.refresh_all()
+
+    def move_stock(self) -> None:
+        product = self._selected_product()
+        if product is None:
+            return
+        dialog = StockDialog(self.root, self.db, product)
+        if dialog.result:
+            self.refresh_all()
+
+    def refresh_report(self) -> None:
+        if self.report_sales_tree is None:
+            return
+        start = self.report_start.get().strip()
+        end = self.report_end.get().strip()
+        try:
+            parsed_start = date.fromisoformat(start)
+            parsed_end = date.fromisoformat(end)
+        except ValueError:
+            messagebox.showerror("Tarih aralığı geçersiz", "Tarihleri YYYY-AA-GG biçiminde girin.", parent=self.root)
+            return
+        if parsed_start > parsed_end:
+            messagebox.showerror("Tarih aralığı geçersiz", "Başlangıç tarihi bitiş tarihinden sonra olamaz.", parent=self.root)
+            return
+        sales, top_items, total = self.db.report(start, end)
+        self._clear_tree(self.report_sales_tree)
+        for row in sales:
+            shown_date = datetime.fromisoformat(row["sold_at"]).strftime("%d.%m.%Y %H:%M")
+            self.report_sales_tree.insert("", "end", values=(f"#{row['id']}", shown_date, row["payment_method"], money(row["total"])))
+        self._clear_tree(self.report_items_tree)
+        for row in top_items:
+            self.report_items_tree.insert("", "end", values=(row["product_name"], quantity(row["qty"]), money(row["total"])))
+        self.report_total.configure(text=f"Dönem satış toplamı: {money(total)}  •  {len(sales)} satış")
+
+    def export_report(self) -> None:
+        self.refresh_report()
+        start, end = self.report_start.get().strip(), self.report_end.get().strip()
+        try:
+            parsed_start = date.fromisoformat(start)
+            parsed_end = date.fromisoformat(end)
+        except ValueError:
+            messagebox.showerror("Tarih aralığı geçersiz", "Tarihleri YYYY-AA-GG biçiminde girin.", parent=self.root)
+            return
+        if parsed_start > parsed_end:
+            messagebox.showerror("Tarih aralığı geçersiz", "Başlangıç tarihi bitiş tarihinden sonra olamaz.", parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(parent=self.root, title="Satış raporunu kaydet",
+                    defaultextension=".csv", initialfile=f"satis_raporu_{start}_{end}.csv",
+                    filetypes=[("CSV dosyası", "*.csv")])
+        if not path:
+            return
+        sales, top_items, total = self.db.report(start, end)
+        with open(path, "w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.writer(file, delimiter=";")
+            writer.writerow(["SATIŞLAR"])
+            writer.writerow(["Fiş", "Tarih", "Ödeme", "Toplam (TL)"])
+            for row in sales:
+                writer.writerow([row["id"], row["sold_at"], row["payment_method"], row["total"]])
+            writer.writerow([])
+            writer.writerow(["Dönem toplamı (TL)", total])
+            writer.writerow([])
+            writer.writerow(["EN ÇOK CİRO YAPAN ÜRÜNLER"])
+            writer.writerow(["Ürün", "Satılan miktar", "Ciro (TL)"])
+            for row in top_items:
+                writer.writerow([row["product_name"], row["qty"], row["total"]])
+        messagebox.showinfo("Rapor kaydedildi", f"CSV raporu kaydedildi:\n{path}", parent=self.root)
+
+    def close(self) -> None:
+        self.db.close()
+        self.root.destroy()
+
+
+def main() -> None:
+    root = tk.Tk()
+    InventoryApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
