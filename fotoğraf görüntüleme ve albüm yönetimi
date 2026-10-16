@@ -1,0 +1,421 @@
+"""Tkinter photo viewer and JSON-backed album manager."""
+
+from __future__ import annotations
+
+import os
+import json
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+from PIL import Image, ImageTk, UnidentifiedImageError
+
+from photo_library import append_unique_images, load_albums, save_albums, scan_images
+
+
+APP_DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "FotoAlbumYoneticisi"
+ALBUMS_FILE = APP_DATA_DIR / "albums.json"
+
+
+class PhotoAlbumManager(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Fotoğraf Görüntüleyici ve Albüm Yöneticisi")
+        self.geometry("1180x760")
+        self.minsize(900, 580)
+
+        self.directory_var = tk.StringVar(value=str(Path.home()))
+        self.status_var = tk.StringVar(value="Görüntülemek için bir klasör seçin.")
+        self.image_files: list[Path] = []
+        self.current_image: Path | None = None
+        self.current_photo: ImageTk.PhotoImage | None = None
+        self.albums_file = ALBUMS_FILE
+        self.albums: dict[str, list[str]] = {}
+        self.current_album: str | None = None
+        self.album_image_paths: list[str] = []
+
+        try:
+            self.albums = load_albums(self.albums_file)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            messagebox.showerror(
+                "Albüm dosyası okunamadı",
+                f"Albüm verileri yüklenemedi:\n{error}",
+                parent=self,
+            )
+            self.destroy()
+            return
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._refresh_directory()
+        self._refresh_album_list()
+
+    def _build_ui(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(self, padding=(12, 10))
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.columnconfigure(0, weight=1)
+        directory_entry = ttk.Entry(toolbar, textvariable=self.directory_var)
+        directory_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        directory_entry.bind("<Return>", lambda _event: self._refresh_directory())
+        ttk.Button(toolbar, text="Klasör seç", command=self._choose_directory).grid(
+            row=0, column=1, padx=4
+        )
+        ttk.Button(toolbar, text="Üst klasör", command=self._go_up).grid(
+            row=0, column=2, padx=4
+        )
+        ttk.Button(toolbar, text="Yenile", command=self._refresh_directory).grid(
+            row=0, column=3, padx=(4, 0)
+        )
+        content = ttk.Frame(self, padding=(12, 0, 12, 10))
+        content.grid(row=1, column=0, sticky="nsew")
+        content.rowconfigure(0, weight=1)
+        content.columnconfigure(0, weight=2, minsize=230)
+        content.columnconfigure(1, weight=5, minsize=360)
+        content.columnconfigure(2, weight=2, minsize=230)
+
+        image_panel = ttk.LabelFrame(content, text="Fotoğraflar", padding=8)
+        image_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        image_panel.rowconfigure(0, weight=1)
+        image_panel.columnconfigure(0, weight=1)
+        self.image_list = tk.Listbox(image_panel, exportselection=False)
+        self.image_list.grid(row=0, column=0, sticky="nsew")
+        image_scroll = ttk.Scrollbar(
+            image_panel, orient="vertical", command=self.image_list.yview
+        )
+        image_scroll.grid(row=0, column=1, sticky="ns")
+        self.image_list.configure(yscrollcommand=image_scroll.set)
+        self.image_list.bind("<<ListboxSelect>>", self._select_image)
+        self.image_list.bind("<Double-1>", self._select_image)
+        ttk.Button(
+            image_panel, text="Seçili fotoğrafı albüme ekle", command=self._add_to_album
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        viewer = ttk.LabelFrame(content, text="Görüntüleyici", padding=8)
+        viewer.grid(row=0, column=1, sticky="nsew", padx=4)
+        viewer.rowconfigure(0, weight=1)
+        viewer.columnconfigure(0, weight=1)
+        self.preview = ttk.Label(
+            viewer,
+            text="Bir fotoğraf seçin",
+            anchor="center",
+            justify="center",
+        )
+        self.preview.grid(row=0, column=0, sticky="nsew")
+        nav = ttk.Frame(viewer)
+        nav.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        nav.columnconfigure(1, weight=1)
+        ttk.Button(nav, text="‹ Önceki", command=lambda: self._step_image(-1)).grid(
+            row=0, column=0
+        )
+        self.image_name_label = ttk.Label(nav, text="", anchor="center")
+        self.image_name_label.grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Button(nav, text="Sonraki ›", command=lambda: self._step_image(1)).grid(
+            row=0, column=2
+        )
+        viewer.bind("<Configure>", self._resize_preview)
+
+        album_panel = ttk.LabelFrame(content, text="Albümler", padding=8)
+        album_panel.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        album_panel.rowconfigure(2, weight=1)
+        album_panel.rowconfigure(4, weight=2)
+        album_panel.columnconfigure(0, weight=1)
+        ttk.Button(album_panel, text="Yeni albüm", command=self._create_album).grid(
+            row=0, column=0, sticky="ew", pady=(0, 6)
+        )
+        ttk.Label(album_panel, text="Albüm listesi").grid(
+            row=1, column=0, sticky="w"
+        )
+        self.album_list = tk.Listbox(album_panel, exportselection=False)
+        self.album_list.grid(row=2, column=0, sticky="nsew")
+        album_scroll = ttk.Scrollbar(
+            album_panel, orient="vertical", command=self.album_list.yview
+        )
+        album_scroll.grid(row=2, column=1, sticky="ns")
+        self.album_list.configure(yscrollcommand=album_scroll.set)
+        self.album_list.bind("<<ListboxSelect>>", self._select_album)
+        ttk.Label(album_panel, text="Fotoğraflar albümde").grid(
+            row=3, column=0, sticky="w", pady=(8, 0)
+        )
+        self.album_image_list = tk.Listbox(album_panel, exportselection=False)
+        self.album_image_list.grid(row=4, column=0, sticky="nsew")
+        album_image_scroll = ttk.Scrollbar(
+            album_panel, orient="vertical", command=self.album_image_list.yview
+        )
+        album_image_scroll.grid(row=4, column=1, sticky="ns")
+        self.album_image_list.configure(yscrollcommand=album_image_scroll.set)
+        self.album_image_list.bind("<Double-1>", self._open_album_image)
+        ttk.Button(
+            album_panel, text="Albümden çıkar", command=self._remove_from_album
+        ).grid(row=5, column=0, sticky="ew", pady=(8, 4))
+        ttk.Button(album_panel, text="Albümü sil", command=self._delete_album).grid(
+            row=6, column=0, sticky="ew", pady=4
+        )
+        ttk.Separator(album_panel).grid(row=7, column=0, sticky="ew", pady=8)
+        ttk.Button(
+            album_panel, text="Albümleri içe aktar", command=self._import_albums
+        ).grid(row=8, column=0, sticky="ew", pady=4)
+        ttk.Button(
+            album_panel, text="Albümleri dışa aktar", command=self._export_albums
+        ).grid(row=9, column=0, sticky="ew", pady=4)
+
+        ttk.Label(self, textvariable=self.status_var, anchor="w", padding=(12, 5)).grid(
+            row=2, column=0, sticky="ew"
+        )
+        self.bind("<Left>", lambda _event: self._step_image(-1))
+        self.bind("<Right>", lambda _event: self._step_image(1))
+
+    def _refresh_directory(self) -> None:
+        try:
+            images = scan_images(self.directory_var.get())
+        except (OSError, NotADirectoryError) as error:
+            messagebox.showerror("Klasör açılamadı", str(error), parent=self)
+            return
+
+        self.image_files = images
+        self.image_list.delete(0, tk.END)
+        for image_path in images:
+            self.image_list.insert(tk.END, image_path.name)
+        self.current_image = None
+        self.current_photo = None
+        self.preview.configure(image="", text="Bir fotoğraf seçin")
+        self.image_name_label.configure(text="")
+        self.status_var.set(f"{len(images)} fotoğraf bulundu.")
+
+    def _choose_directory(self) -> None:
+        directory = filedialog.askdirectory(
+            initialdir=self.directory_var.get() or str(Path.home()),
+            parent=self,
+            title="Fotoğraf klasörü seçin",
+        )
+        if directory:
+            self.directory_var.set(directory)
+            self._refresh_directory()
+
+    def _go_up(self) -> None:
+        current = Path(self.directory_var.get()).expanduser()
+        parent = current.parent
+        if parent != current:
+            self.directory_var.set(str(parent))
+            self._refresh_directory()
+
+    def _select_image(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        selection = self.image_list.curselection()
+        if not selection:
+            return
+        image_path = self.image_files[selection[0]]
+        self.current_image = image_path
+        self._display_image()
+
+    def _display_image(self) -> None:
+        if self.current_image is None:
+            return
+        try:
+            with Image.open(self.current_image) as image:
+                image.load()
+                dimensions = image.size
+                image.thumbnail(
+                    (
+                        max(1, self.preview.winfo_width() - 16),
+                        max(1, self.preview.winfo_height() - 16),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+                self.current_photo = ImageTk.PhotoImage(image.copy())
+        except (OSError, ValueError, UnidentifiedImageError) as error:
+            messagebox.showerror(
+                "Fotoğraf açılamadı",
+                f"{self.current_image}\n\n{error}",
+                parent=self,
+            )
+            return
+        self.preview.configure(image=self.current_photo, text="")
+        self.image_name_label.configure(text=self.current_image.name)
+        self.status_var.set(
+            f"{self.current_image.name}  ·  {dimensions[0]} × {dimensions[1]}"
+        )
+
+    def _resize_preview(self, event: tk.Event[tk.Misc]) -> None:
+        if event.widget is self.preview.master and self.current_image is not None:
+            self.after_idle(self._display_image)
+
+    def _step_image(self, step: int) -> None:
+        if not self.image_files:
+            return
+        selection = self.image_list.curselection()
+        current_index = selection[0] if selection else 0
+        next_index = (current_index + step) % len(self.image_files)
+        self.image_list.selection_clear(0, tk.END)
+        self.image_list.selection_set(next_index)
+        self.image_list.see(next_index)
+        self._select_image()
+
+    def _refresh_album_list(self, selected_name: str | None = None) -> None:
+        names = list(self.albums)
+        self.album_list.delete(0, tk.END)
+        for name in names:
+            self.album_list.insert(tk.END, f"{name} ({len(self.albums[name])})")
+        self.current_album = selected_name if selected_name in self.albums else None
+        if self.current_album is not None:
+            index = names.index(self.current_album)
+            self.album_list.selection_set(index)
+        self._refresh_album_images()
+
+    def _select_album(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        selection = self.album_list.curselection()
+        if not selection:
+            self.current_album = None
+            return
+        self.current_album = list(self.albums)[selection[0]]
+        self._refresh_album_images()
+        self.status_var.set(
+            f"{self.current_album}: {len(self.albums[self.current_album])} fotoğraf"
+        )
+
+    def _refresh_album_images(self) -> None:
+        self.album_image_list.delete(0, tk.END)
+        self.album_image_paths = (
+            self.albums.get(self.current_album, [])
+            if self.current_album is not None
+            else []
+        )
+        for image_path in self.album_image_paths:
+            self.album_image_list.insert(tk.END, Path(image_path).name)
+
+    def _open_album_image(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        selection = self.album_image_list.curselection()
+        if not selection:
+            return
+        self.current_image = Path(self.album_image_paths[selection[0]])
+        self._display_image()
+
+    def _create_album(self) -> None:
+        name = simpledialog.askstring("Yeni albüm", "Albüm adı:", parent=self)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showwarning("Geçersiz ad", "Albüm adı boş olamaz.", parent=self)
+            return
+        if name in self.albums:
+            messagebox.showwarning("Albüm mevcut", "Bu adla bir albüm zaten var.", parent=self)
+            return
+        self.albums[name] = []
+        self._save_current_albums(name)
+
+    def _add_to_album(self) -> None:
+        if self.current_album is None:
+            messagebox.showinfo("Albüm seçin", "Önce bir albüm seçin.", parent=self)
+            return
+        selection = self.image_list.curselection()
+        if not selection:
+            messagebox.showinfo("Fotoğraf seçin", "Önce bir fotoğraf seçin.", parent=self)
+            return
+        paths = append_unique_images(
+            self.albums[self.current_album], [self.image_files[selection[0]]]
+        )
+        if len(paths) == len(self.albums[self.current_album]):
+            self.status_var.set("Bu fotoğraf albümde zaten bulunuyor.")
+            return
+        self.albums[self.current_album] = paths
+        self._save_current_albums(self.current_album)
+
+    def _remove_from_album(self) -> None:
+        if self.current_album is None:
+            messagebox.showinfo("Albüm seçin", "Önce bir albüm seçin.", parent=self)
+            return
+        selection = self.album_image_list.curselection()
+        if not selection:
+            messagebox.showinfo(
+                "Fotoğraf seçin",
+                "Albüm listesinden çıkarılacak bir fotoğraf seçin.",
+                parent=self,
+            )
+            return
+        album = self.albums[self.current_album]
+        album.pop(selection[0])
+        self._save_current_albums(self.current_album)
+
+    def _delete_album(self) -> None:
+        if self.current_album is None:
+            messagebox.showinfo("Albüm seçin", "Önce bir albüm seçin.", parent=self)
+            return
+        name = self.current_album
+        if not messagebox.askyesno(
+            "Albümü sil", f"'{name}' albümü silinsin mi?", parent=self
+        ):
+            return
+        del self.albums[name]
+        self._save_current_albums()
+
+    def _save_current_albums(self, selected_name: str | None = None) -> None:
+        try:
+            save_albums(self.albums_file, self.albums)
+        except OSError as error:
+            messagebox.showerror(
+                "Albümler kaydedilemedi", str(error), parent=self
+            )
+            return
+        self._refresh_album_list(selected_name)
+        self.status_var.set("Albüm değişiklikleri kaydedildi.")
+
+    def _import_albums(self) -> None:
+        file_path = filedialog.askopenfilename(
+            parent=self,
+            title="Albüm JSON dosyasını seçin",
+            filetypes=[("JSON dosyaları", "*.json"), ("Tüm dosyalar", "*.*")],
+        )
+        if not file_path:
+            return
+        try:
+            imported = load_albums(file_path)
+            merged = dict(self.albums)
+            for name, paths in imported.items():
+                merged[name] = append_unique_images(merged.get(name, []), paths)
+            save_albums(self.albums_file, merged)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            messagebox.showerror(
+                "Albümler içe aktarılamadı", str(error), parent=self
+            )
+            return
+        self.albums = merged
+        self._refresh_album_list(self.current_album)
+        self.status_var.set(f"{len(imported)} albüm içe aktarıldı.")
+
+    def _export_albums(self) -> None:
+        file_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Albümleri dışa aktar",
+            defaultextension=".json",
+            filetypes=[("JSON dosyaları", "*.json")],
+        )
+        if not file_path:
+            return
+        try:
+            save_albums(file_path, self.albums)
+        except OSError as error:
+            messagebox.showerror(
+                "Albümler dışa aktarılamadı", str(error), parent=self
+            )
+            return
+        self.status_var.set("Albümler JSON dosyasına aktarıldı.")
+
+    def _close(self) -> None:
+        try:
+            save_albums(self.albums_file, self.albums)
+        except OSError as error:
+            if not messagebox.askyesno(
+                "Kaydetme hatası",
+                f"Albümler kaydedilemedi:\n{error}\n\nYine de kapatılsın mı?",
+                parent=self,
+            ):
+                return
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = PhotoAlbumManager()
+    if app.winfo_exists():
+        app.mainloop()
