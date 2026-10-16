@@ -1,0 +1,267 @@
+"""Tkinter interface for Pano Hafızası."""
+
+from __future__ import annotations
+
+import sqlite3
+import tkinter as tk
+from importlib import import_module
+from tkinter import messagebox, ttk
+
+_clipboard_history = import_module(
+    f"{__package__}.clipboard_history" if __package__ else "clipboard_history"
+)
+CATEGORIES = _clipboard_history.CATEGORIES
+ClipboardHistory = _clipboard_history.ClipboardHistory
+ClipboardItem = _clipboard_history.ClipboardItem
+
+POLL_INTERVAL_MS = 800
+PREVIEW_LENGTH = 110
+
+
+class ClipboardHistoryApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.history = ClipboardHistory()
+        self.last_clipboard_text = ""
+        self.clipboard_read_error = False
+        self.clipboard_save_error_text: str | None = None
+        self.item_by_id: dict[int, ClipboardItem] = {}
+        self.search_var = tk.StringVar()
+        self.category_var = tk.StringVar(value=CATEGORIES[0])
+        self.favorites_only_var = tk.BooleanVar(value=False)
+        self.status_var = tk.StringVar(value="Pano izleniyor.")
+
+        self.root.title("Pano Hafızası")
+        self.root.geometry("900x590")
+        self.root.minsize(650, 400)
+        self._build_interface()
+        self.refresh_items()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.after(250, self._poll_clipboard)
+
+    def _build_interface(self) -> None:
+        outer = ttk.Frame(self.root, padding=18)
+        outer.pack(fill=tk.BOTH, expand=True)
+        outer.columnconfigure(0, weight=1)
+
+        ttk.Label(outer, text="Pano Hafızası", font=("Segoe UI", 20, "bold")).grid(
+            row=0, column=0, sticky=tk.W
+        )
+        ttk.Label(
+            outer,
+            text="Kopyaladığın metinleri ara, favorile ve tek tıkla yeniden kopyala.",
+        ).grid(row=1, column=0, sticky=tk.W, pady=(2, 14))
+
+        filters = ttk.Frame(outer)
+        filters.grid(row=2, column=0, sticky="new", pady=(0, 10))
+        filters.columnconfigure(0, weight=1)
+        self.search_entry = ttk.Entry(filters, textvariable=self.search_var)
+        self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        category_picker = ttk.Combobox(
+            filters,
+            textvariable=self.category_var,
+            values=CATEGORIES,
+            state="readonly",
+            width=13,
+        )
+        category_picker.grid(row=0, column=1, padx=(0, 8))
+        category_picker.bind("<<ComboboxSelected>>", self._on_category_selected)
+        ttk.Checkbutton(
+            filters,
+            text="Yalnızca favoriler",
+            variable=self.favorites_only_var,
+            command=self.refresh_items,
+        ).grid(row=0, column=2)
+        self.search_var.trace_add("write", self._on_search_changed)
+
+        columns = ("favorite", "category", "copied_at", "preview")
+        self.tree = ttk.Treeview(outer, columns=columns, show="headings", selectmode="browse")
+        self.tree.column("favorite", width=42, minwidth=42, anchor=tk.CENTER, stretch=False)
+        self.tree.column("category", width=95, minwidth=85, stretch=False)
+        self.tree.column("copied_at", width=155, minwidth=125, stretch=False)
+        self.tree.column("preview", width=450, minwidth=140)
+        self.tree.heading("favorite", text="★")
+        self.tree.heading("category", text="Kategori")
+        self.tree.heading("copied_at", text="Kopyalanma")
+        self.tree.heading("preview", text="Metin")
+        self.tree.grid(row=3, column=0, sticky="nsew")
+        outer.rowconfigure(3, weight=1)
+        scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self.tree.yview)
+        scrollbar.grid(row=3, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.bind("<<TreeviewSelect>>", self._show_selected_text)
+        self.tree.bind("<Double-1>", self._copy_double_clicked_row)
+
+        self.preview = tk.Text(outer, height=5, wrap=tk.WORD, state=tk.DISABLED)
+        self.preview.grid(row=4, column=0, sticky="ew", pady=(12, 10))
+
+        buttons = ttk.Frame(outer)
+        buttons.grid(row=5, column=0, sticky=tk.W)
+        ttk.Button(buttons, text="Seçileni kopyala", command=self.copy_selected).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(
+            buttons, text="Favori durumunu değiştir", command=self.toggle_selected_favorite
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="Sil", command=self.delete_selected).pack(side=tk.LEFT)
+        ttk.Label(outer, textvariable=self.status_var, anchor=tk.W).grid(
+            row=6, column=0, sticky="ew", pady=(12, 0)
+        )
+
+    def refresh_items(self) -> None:
+        selected = self.tree.selection() if hasattr(self, "tree") else ()
+        items = self.history.search(
+            query=self.search_var.get(),
+            category=self.category_var.get(),
+            favorites_only=self.favorites_only_var.get(),
+        )
+        self.item_by_id = {item.id: item for item in items}
+        self.tree.delete(*self.tree.get_children())
+        for item in items:
+            preview = item.text.replace("\r\n", "\n").replace("\r", "\n")
+            preview = " ".join(preview.splitlines())
+            if len(preview) > PREVIEW_LENGTH:
+                preview = preview[: PREVIEW_LENGTH - 1] + "…"
+            self.tree.insert(
+                "",
+                tk.END,
+                iid=str(item.id),
+                values=(
+                    "★" if item.favorite else "",
+                    item.category,
+                    item.copied_at[:19].replace("T", " ") + " UTC",
+                    preview,
+                ),
+            )
+
+        if selected and selected[0] in self.item_by_id:
+            self.tree.selection_set(selected[0])
+            self.tree.focus(selected[0])
+        self._show_selected_text()
+        self.status_var.set(f"{len(items)} kayıt gösteriliyor. Pano izleniyor.")
+
+    def _on_category_selected(self, event: tk.Event) -> None:
+        selected_category = event.widget.get()
+        if selected_category in CATEGORIES:
+            self.category_var.set(selected_category)
+            self.refresh_items()
+
+    def _on_search_changed(self, *trace_info: str) -> None:
+        if len(trace_info) == 3 and trace_info[2] == "write":
+            self.refresh_items()
+
+    def _selected_item(self) -> ClipboardItem | None:
+        selected = self.tree.selection()
+        if not selected:
+            return None
+        return self.item_by_id.get(int(selected[0]))
+
+    def _show_selected_text(self, _event: tk.Event | None = None) -> None:
+        item = self._selected_item()
+        self.preview.configure(state=tk.NORMAL)
+        self.preview.delete("1.0", tk.END)
+        if item is not None:
+            self.preview.insert("1.0", item.text)
+        self.preview.configure(state=tk.DISABLED)
+
+    def _copy_double_clicked_row(self, event: tk.Event) -> None:
+        row_id = self.tree.identify_row(event.y)
+        if row_id:
+            self.tree.selection_set(row_id)
+            self.copy_selected()
+
+    def copy_selected(self) -> None:
+        item = self._selected_item()
+        if item is None:
+            self.status_var.set("Önce kopyalanacak bir kayıt seç.")
+            return
+        try:
+            self._copy_to_clipboard(item.text)
+        except tk.TclError as error:
+            self._show_error("Metin panoya kopyalanamadı", error)
+            self.status_var.set("Metin panoya kopyalanamadı.")
+            return
+        self.status_var.set("Metin panoya kopyalandı.")
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
+        self.last_clipboard_text = text
+        self.clipboard_save_error_text = None
+
+    def toggle_selected_favorite(self) -> None:
+        item = self._selected_item()
+        if item is None:
+            self.status_var.set("Önce favorilere eklenecek bir kayıt seç.")
+            return
+        try:
+            is_favorite = self.history.toggle_favorite(item.id)
+        except (sqlite3.Error, LookupError) as error:
+            self._show_error("Favori güncellenemedi", error)
+            return
+        self.refresh_items()
+        self.status_var.set("Favorilere eklendi." if is_favorite else "Favorilerden çıkarıldı.")
+
+    def delete_selected(self) -> None:
+        item = self._selected_item()
+        if item is None:
+            self.status_var.set("Önce silinecek bir kayıt seç.")
+            return
+        if not messagebox.askyesno(
+            "Kaydı sil", "Seçili pano kaydı kalıcı olarak silinsin mi?", parent=self.root
+        ):
+            return
+        try:
+            self.history.delete(item.id)
+        except (sqlite3.Error, LookupError) as error:
+            self._show_error("Kayıt silinemedi", error)
+            return
+        self.refresh_items()
+        self.status_var.set("Pano kaydı silindi.")
+
+    def _poll_clipboard(self) -> None:
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            if not self.clipboard_read_error:
+                self.status_var.set("Pano metni okunamadı; izleme sürüyor.")
+                self.clipboard_read_error = True
+            self.root.after(POLL_INTERVAL_MS, self._poll_clipboard)
+            return
+
+        self.clipboard_read_error = False
+        if text != self.last_clipboard_text:
+            try:
+                added = self.history.add_text(text)
+            except sqlite3.Error as error:
+                if self.clipboard_save_error_text != text:
+                    self._show_error("Pano geçmişi kaydedilemedi", error)
+                    self.clipboard_save_error_text = text
+                self.status_var.set("Kayıt başarısız; pano metni yeniden denenecek.")
+            else:
+                self.last_clipboard_text = text
+                self.clipboard_save_error_text = None
+                if added:
+                    self.refresh_items()
+                    self.status_var.set("Yeni metin panoya kaydedildi.")
+        self.root.after(POLL_INTERVAL_MS, self._poll_clipboard)
+
+    def _show_error(self, title: str, error: Exception) -> None:
+        messagebox.showerror(title, str(error), parent=self.root)
+
+    def close(self) -> None:
+        try:
+            self.history.close()
+        finally:
+            self.root.destroy()
+
+
+def main() -> None:
+    root = tk.Tk()
+    ClipboardHistoryApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
