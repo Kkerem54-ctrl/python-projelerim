@@ -1,0 +1,459 @@
+"""A small VLC-powered desktop media player."""
+
+from __future__ import annotations
+
+from importlib import import_module
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+import customtkinter as ctk
+
+from media_library import append_unique_paths, scan_media_files
+
+
+class MediaPlayerApp(ctk.CTk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Media Player")
+        self.geometry("1100x760")
+        self.minsize(820, 600)
+
+        try:
+            vlc = import_module("vlc")
+        except (ImportError, OSError) as error:
+            self._show_startup_error(error)
+            return
+
+        self.vlc = vlc
+        try:
+            self.vlc_instance = vlc.Instance("--no-video-title-show")
+            if self.vlc_instance is None:
+                raise RuntimeError("VLC oynatıcı başlatılamadı.")
+            self.player = self.vlc_instance.media_player_new()
+        except (OSError, RuntimeError, vlc.VLCException) as error:
+            self._show_startup_error(error)
+            return
+
+        self.media_files: list[Path] = []
+        self.playlist: list[Path] = []
+        self.current_index: int | None = None
+        self._is_seeking = False
+        self._slider_update = False
+        self._last_state = None
+        self.directory_var = ctk.StringVar(value=str(Path.home()))
+        self.status_var = ctk.StringVar(value="Bir klasör seçin veya dizin yolunu girin.")
+        self.time_var = ctk.StringVar(value="00:00 / 00:00")
+
+        self._configure_treeview()
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.after(500, self._poll_playback)
+
+    def _show_startup_error(self, error: Exception) -> None:
+        if isinstance(error, OSError):
+            details = (
+                "VLC'nin masaüstü uygulaması veya libvlc.dll bulunamadı. "
+                "python-vlc tek başına yeterli değildir. VLC'yi "
+                "https://www.videolan.org/vlc/ adresinden kurun ve uygulamayı "
+                "yeniden başlatın."
+            )
+        else:
+            details = (
+                "python-vlc Python paketi yüklenemedi. Proje klasöründe "
+                "`python -m pip install -r requirements.txt` komutunu çalıştırın."
+            )
+        messagebox.showerror(
+            "Medya oynatıcı başlatılamadı",
+            "Oynatıcı başlatılamadı.\n\n"
+            f"{details}\n\nAyrıntı: {error}",
+            parent=self,
+        )
+        self.destroy()
+
+    @staticmethod
+    def _configure_treeview() -> None:
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure(
+            "Media.Treeview",
+            background="#202020",
+            foreground="#eeeeee",
+            fieldbackground="#202020",
+            rowheight=29,
+            borderwidth=0,
+        )
+        style.configure(
+            "Media.Treeview.Heading",
+            background="#303030",
+            foreground="#eeeeee",
+            relief="flat",
+        )
+        style.map("Media.Treeview", background=[("selected", "#1f6aa5")])
+
+    def _build_ui(self) -> None:
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        header = ctk.CTkLabel(
+            self, text="MEDIA PLAYER", font=ctk.CTkFont(size=25, weight="bold")
+        )
+        header.grid(row=0, column=0, padx=20, pady=(18, 10), sticky="w")
+
+        folder_bar = ctk.CTkFrame(self)
+        folder_bar.grid(row=1, column=0, padx=20, pady=(0, 12), sticky="ew")
+        folder_bar.grid_columnconfigure(0, weight=1)
+        self.directory_entry = ctk.CTkEntry(
+            folder_bar,
+            textvariable=self.directory_var,
+            placeholder_text="Dizin yolu",
+        )
+        self.directory_entry.grid(row=0, column=0, padx=(10, 6), pady=10, sticky="ew")
+        self.directory_entry.bind(
+            "<Return>",
+            lambda event: self._scan_directory()
+            if event.widget == self.directory_entry
+            else None,
+        )
+        ctk.CTkButton(
+            folder_bar, text="Klasör seç", width=105, command=self._choose_directory
+        ).grid(row=0, column=1, padx=5, pady=10)
+        ctk.CTkButton(
+            folder_bar, text="Üst dizin", width=95, command=self._go_up
+        ).grid(row=0, column=2, padx=5, pady=10)
+        ctk.CTkButton(
+            folder_bar, text="Yenile", width=80, command=self._scan_directory
+        ).grid(row=0, column=3, padx=(5, 10), pady=10)
+
+        content = ctk.CTkFrame(self)
+        content.grid(row=2, column=0, padx=20, pady=(0, 12), sticky="nsew")
+        content.grid_columnconfigure((0, 1), weight=1, uniform="lists")
+        content.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            content, text="Dizindeki medya dosyaları", font=ctk.CTkFont(weight="bold")
+        ).grid(row=0, column=0, padx=12, pady=(12, 6), sticky="w")
+        ctk.CTkLabel(
+            content, text="Çalma listesi", font=ctk.CTkFont(weight="bold")
+        ).grid(row=0, column=1, padx=12, pady=(12, 6), sticky="w")
+
+        media_panel = ctk.CTkFrame(content, fg_color="transparent")
+        media_panel.grid(row=1, column=0, padx=(12, 6), pady=(0, 8), sticky="nsew")
+        media_panel.grid_columnconfigure(0, weight=1)
+        media_panel.grid_rowconfigure(0, weight=1)
+        self.media_tree = self._make_tree(media_panel, ("name", "type"), (240, 70))
+        self.media_tree.grid(row=0, column=0, sticky="nsew")
+        self.media_tree.bind(
+            "<Double-1>",
+            lambda event: self._add_selected()
+            if event.widget.winfo_id() == self.media_tree.winfo_id()
+            else None,
+        )
+        self._add_tree_scrollbar(media_panel, self.media_tree, 1)
+
+        playlist_panel = ctk.CTkFrame(content, fg_color="transparent")
+        playlist_panel.grid(row=1, column=1, padx=(6, 12), pady=(0, 8), sticky="nsew")
+        playlist_panel.grid_columnconfigure(0, weight=1)
+        playlist_panel.grid_rowconfigure(0, weight=1)
+        self.playlist_tree = self._make_tree(playlist_panel, ("name", "type"), (240, 70))
+        self.playlist_tree.grid(row=0, column=0, sticky="nsew")
+        self.playlist_tree.bind(
+            "<Double-1>",
+            lambda event: self._play_selected()
+            if event.widget.winfo_id() == self.playlist_tree.winfo_id()
+            else None,
+        )
+        self._add_tree_scrollbar(playlist_panel, self.playlist_tree, 1)
+
+        list_actions = ctk.CTkFrame(content, fg_color="transparent")
+        list_actions.grid(row=2, column=0, columnspan=2, padx=8, pady=(0, 8), sticky="ew")
+        ctk.CTkButton(
+            list_actions, text="Seçileni listeye ekle", command=self._add_selected
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            list_actions, text="Tümünü ekle", command=self._add_all
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            list_actions, text="Listeden çıkar", command=self._remove_selected
+        ).pack(side="right", padx=4)
+        ctk.CTkButton(
+            list_actions, text="Listeyi temizle", command=self._clear_playlist
+        ).pack(side="right", padx=4)
+
+        self.video_frame = ctk.CTkFrame(self, height=190, fg_color="#080808")
+        self.video_frame.grid(row=3, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.video_frame.grid_propagate(False)
+        self.video_placeholder = ctk.CTkLabel(
+            self.video_frame,
+            text="Video oynatımı burada görüntülenir",
+            text_color="#858585",
+        )
+        self.video_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        self.update_idletasks()
+        self.player.set_hwnd(self.video_frame.winfo_id())
+
+        playback = ctk.CTkFrame(self)
+        playback.grid(row=4, column=0, padx=20, pady=(0, 8), sticky="ew")
+        playback.grid_columnconfigure(0, weight=1)
+        self.seek_slider = ctk.CTkSlider(
+            playback, from_=0, to=1000, command=self._seek
+        )
+        self.seek_slider.grid(row=0, column=0, columnspan=5, padx=14, pady=(12, 4), sticky="ew")
+        ctk.CTkLabel(playback, textvariable=self.time_var, width=120).grid(
+            row=1, column=0, padx=10, pady=(0, 10), sticky="w"
+        )
+        controls = ctk.CTkFrame(playback, fg_color="transparent")
+        controls.grid(row=1, column=1, columnspan=3, pady=(0, 8))
+        ctk.CTkButton(controls, text="⏮", width=48, command=self._play_previous).pack(
+            side="left", padx=4
+        )
+        self.play_button = ctk.CTkButton(
+            controls, text="▶ Oynat", width=110, command=self._toggle_play
+        )
+        self.play_button.pack(side="left", padx=4)
+        ctk.CTkButton(controls, text="■ Durdur", width=95, command=self._stop).pack(
+            side="left", padx=4
+        )
+        ctk.CTkButton(controls, text="⏭", width=48, command=self._play_next).pack(
+            side="left", padx=4
+        )
+        ctk.CTkLabel(playback, textvariable=self.status_var, anchor="e").grid(
+            row=1, column=4, padx=10, pady=(0, 10), sticky="e"
+        )
+
+        self._scan_directory()
+
+    @staticmethod
+    def _make_tree(
+        parent: ctk.CTkFrame, columns: tuple[str, str], widths: tuple[int, int]
+    ) -> ttk.Treeview:
+        tree = ttk.Treeview(
+            parent,
+            columns=columns,
+            show="headings",
+            selectmode="extended",
+            style="Media.Treeview",
+        )
+        tree.heading("name", text="Dosya adı")
+        tree.heading("type", text="Tür")
+        tree.column("name", width=widths[0], anchor="w")
+        tree.column("type", width=widths[1], anchor="center", stretch=False)
+        return tree
+
+    @staticmethod
+    def _add_tree_scrollbar(
+        parent: ctk.CTkFrame, tree: ttk.Treeview, column: int
+    ) -> None:
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.grid(
+            row=0,
+            column=column,
+            sticky="ns",
+        )
+
+    def _choose_directory(self) -> None:
+        selected = filedialog.askdirectory(
+            initialdir=self.directory_var.get() or str(Path.home()),
+            title="Medya dosyalarının bulunduğu klasörü seçin",
+        )
+        if selected:
+            self.directory_var.set(selected)
+            self._scan_directory()
+
+    def _go_up(self) -> None:
+        current = Path(self.directory_var.get()).expanduser()
+        parent = current.parent
+        if parent != current:
+            self.directory_var.set(str(parent))
+            self._scan_directory()
+
+    def _scan_directory(self) -> None:
+        try:
+            self.media_files = scan_media_files(self.directory_var.get())
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Dizin okunamadı", str(error), parent=self)
+            return
+
+        self.media_tree.delete(*self.media_tree.get_children())
+        for index, path in enumerate(self.media_files):
+            self.media_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(path.name, path.suffix.upper().lstrip(".")),
+            )
+        self.status_var.set(f"{len(self.media_files)} medya dosyası bulundu.")
+
+    def _selected_media(self) -> list[Path]:
+        indexes = sorted(int(item) for item in self.media_tree.selection())
+        return [self.media_files[index] for index in indexes]
+
+    def _add_selected(self) -> None:
+        selected = self._selected_media()
+        if not selected:
+            self.status_var.set("Listeye eklemek için dosya seçin.")
+            return
+        before = len(self.playlist)
+        self.playlist = append_unique_paths(self.playlist, selected)
+        self._refresh_playlist()
+        self.status_var.set(f"{len(self.playlist) - before} dosya listeye eklendi.")
+
+    def _add_all(self) -> None:
+        before = len(self.playlist)
+        self.playlist = append_unique_paths(self.playlist, self.media_files)
+        self._refresh_playlist()
+        self.status_var.set(f"{len(self.playlist) - before} dosya listeye eklendi.")
+
+    def _refresh_playlist(self) -> None:
+        self.playlist_tree.delete(*self.playlist_tree.get_children())
+        for index, path in enumerate(self.playlist):
+            self.playlist_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(path.name, path.suffix.upper().lstrip(".")),
+            )
+
+    def _remove_selected(self) -> None:
+        selected = {int(item) for item in self.playlist_tree.selection()}
+        if not selected:
+            self.status_var.set("Listeden çıkarmak için dosya seçin.")
+            return
+        removed_before_current = sum(
+            1 for index in selected if self.current_index is not None and index < self.current_index
+        )
+        if self.current_index in selected:
+            self._stop()
+            self.current_index = None
+        self.playlist = [
+            path for index, path in enumerate(self.playlist) if index not in selected
+        ]
+        if self.current_index is not None:
+            self.current_index -= removed_before_current
+        self._refresh_playlist()
+        self.status_var.set(f"{len(selected)} dosya listeden çıkarıldı.")
+
+    def _clear_playlist(self) -> None:
+        if self.current_index is not None:
+            self._stop()
+        self.current_index = None
+        self.playlist.clear()
+        self._refresh_playlist()
+        self.status_var.set("Çalma listesi temizlendi.")
+
+    def _play_selected(self) -> None:
+        selection = self.playlist_tree.selection()
+        if selection:
+            self._play_index(int(selection[0]))
+        else:
+            self.status_var.set("Çalmak için çalma listesinden bir dosya seçin.")
+
+    def _play_index(self, index: int) -> None:
+        if not 0 <= index < len(self.playlist):
+            return
+        path = self.playlist[index]
+        if not path.is_file():
+            messagebox.showerror(
+                "Dosya bulunamadı", f"Medya dosyasına erişilemiyor:\n{path}", parent=self
+            )
+            return
+        media = self.vlc_instance.media_new(str(path))
+        self.player.set_media(media)
+        self.current_index = index
+        self.playlist_tree.selection_set(str(index))
+        self.playlist_tree.focus(str(index))
+        self.video_placeholder.place_forget()
+        if self.player.play() == -1:
+            self.status_var.set("Dosya oynatılamadı.")
+            messagebox.showerror(
+                "Oynatma hatası", f"Dosya oynatılamadı:\n{path}", parent=self
+            )
+            return
+        self.play_button.configure(text="⏸ Duraklat")
+        self.status_var.set(f"Oynatılıyor: {path.name}")
+
+    def _toggle_play(self) -> None:
+        state = self.player.get_state()
+        if state == self.vlc.State.Playing:
+            self.player.pause()
+            self.play_button.configure(text="▶ Devam et")
+            self.status_var.set("Oynatma duraklatıldı.")
+            return
+        if state == self.vlc.State.Paused:
+            self.player.play()
+            self.play_button.configure(text="⏸ Duraklat")
+            self.status_var.set("Oynatılıyor.")
+            return
+        selection = self.playlist_tree.selection()
+        if selection:
+            self._play_index(int(selection[0]))
+            return
+        if self.current_index is not None and self.playlist:
+            self._play_index(self.current_index)
+        else:
+            self._play_selected()
+
+    def _play_next(self) -> None:
+        if self.current_index is None:
+            self._play_selected()
+        elif self.current_index + 1 < len(self.playlist):
+            self._play_index(self.current_index + 1)
+        else:
+            self.status_var.set("Çalma listesinin sonuna ulaşıldı.")
+
+    def _play_previous(self) -> None:
+        if self.current_index is None:
+            self._play_selected()
+        elif self.current_index > 0:
+            self._play_index(self.current_index - 1)
+        else:
+            self._play_index(0)
+
+    def _stop(self) -> None:
+        self.player.stop()
+        self.play_button.configure(text="▶ Oynat")
+        self.time_var.set("00:00 / 00:00")
+        self.seek_slider.set(0)
+        self.video_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        self.status_var.set("Oynatma durduruldu.")
+
+    def _seek(self, value: float) -> None:
+        if not self._slider_update and self.player.is_playing():
+            self.player.set_position(float(value) / 1000)
+
+    def _poll_playback(self) -> None:
+        if not self.winfo_exists():
+            return
+        state = self.player.get_state()
+        length = self.player.get_length()
+        current_time = self.player.get_time()
+        if length > 0 and current_time >= 0:
+            self.time_var.set(f"{self._format_time(current_time)} / {self._format_time(length)}")
+            self._slider_update = True
+            self.seek_slider.set(current_time / length * 1000)
+            self._slider_update = False
+        if state == self.vlc.State.Ended and self._last_state != self.vlc.State.Ended:
+            self._play_next()
+        elif state == self.vlc.State.Error and self._last_state != self.vlc.State.Error:
+            self.status_var.set("Bu dosya oynatılamadı veya desteklenmiyor.")
+            self.play_button.configure(text="▶ Oynat")
+        elif state == self.vlc.State.Playing:
+            self.play_button.configure(text="⏸ Duraklat")
+        self._last_state = state
+        self.after(500, self._poll_playback)
+
+    @staticmethod
+    def _format_time(milliseconds: int) -> str:
+        seconds = max(0, milliseconds // 1000)
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    def _close(self) -> None:
+        self.player.stop()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    app = MediaPlayerApp()
+    if app.winfo_exists():
+        app.mainloop()
