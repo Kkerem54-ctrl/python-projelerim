@@ -1,0 +1,776 @@
+import tkinter as tk
+import random
+import math
+import time
+import json
+
+
+WINDOW_TITLE = "Kule Savunması"
+DATA_FILE = "tower_defense_highscore.json"
+FIELD_W = 820
+FIELD_H = 620
+
+PATH_POINTS = [
+    (0, 92), (176, 92), (176, 244), (372, 244),
+    (372, 112), (588, 112), (588, 414), (820, 414),
+]
+
+TOWER_TYPES = {
+    "archer": {
+        "name": "Okçu Kulesi", "short": "O", "cost": 70,
+        "range": 155, "damage": 15, "rate": 0.62,
+        "color": "#3a9d72", "description": "Hızlı ve dengeli saldırı",
+    },
+    "cannon": {
+        "name": "Topçu Kulesi", "short": "T", "cost": 115,
+        "range": 128, "damage": 42, "rate": 1.45,
+        "color": "#cb704b", "description": "Yavaş, alan hasarlı saldırı",
+    },
+    "frost": {
+        "name": "Buz Kulesi", "short": "B", "cost": 95,
+        "range": 145, "damage": 7, "rate": 0.9,
+        "color": "#4e9fc7", "description": "Düşmanları yavaşlatır",
+    },
+}
+
+ENEMY_TYPES = {
+    "scout": {
+        "name": "Akıncı", "hp": 52, "speed": 88, "reward": 12,
+        "armor": 0, "color": "#e76f51", "base_damage": 1,
+    },
+    "runner": {
+        "name": "Koşucu", "hp": 38, "speed": 138, "reward": 10,
+        "armor": 0, "color": "#f4a261", "base_damage": 1,
+    },
+    "brute": {
+        "name": "Yaratık", "hp": 165, "speed": 48, "reward": 24,
+        "armor": 1, "color": "#9d4edd", "base_damage": 2,
+    },
+    "armored": {
+        "name": "Zırhlı", "hp": 112, "speed": 66, "reward": 22,
+        "armor": 5, "color": "#546a7b", "base_damage": 1,
+    },
+    "boss": {
+        "name": "Bölüm Sonu Canavarı", "hp": 680, "speed": 38,
+        "reward": 130, "armor": 4, "color": "#8f2432", "base_damage": 5,
+    },
+}
+
+
+def distance_to_segment(px, py, ax, ay, bx, by):
+    dx = bx - ax
+    dy = by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length_sq))
+    closest_x = ax + t * dx
+    closest_y = ay + t * dy
+    return math.hypot(px - closest_x, py - closest_y)
+
+
+class Enemy:
+    def __init__(self, kind, wave, path_lengths, total_path_length):
+        info = ENEMY_TYPES[kind]
+        scale = 1.0 + (wave - 1) * 0.16
+        self.kind = kind
+        self.name = info["name"]
+        self.max_health = int(info["hp"] * scale)
+        self.health = self.max_health
+        self.speed = info["speed"] * (1.0 + min(wave - 1, 12) * 0.018)
+        self.reward = int(info["reward"] * (1.0 + (wave - 1) * 0.06))
+        self.armor = info["armor"] + (1 if kind == "armored" and wave >= 7 else 0)
+        self.color = info["color"]
+        self.base_damage = info["base_damage"]
+        self.path_lengths = path_lengths
+        self.total_path_length = total_path_length
+        self.travelled = 0.0
+        self.x, self.y = PATH_POINTS[0]
+        self.alive = True
+        self.slow_until = 0.0
+        self.slow_factor = 1.0
+
+    def update(self, dt, now):
+        if not self.alive:
+            return False
+        speed_factor = self.slow_factor if now < self.slow_until else 1.0
+        if now >= self.slow_until:
+            self.slow_factor = 1.0
+        self.travelled += self.speed * speed_factor * dt
+        if self.travelled >= self.total_path_length:
+            self.x, self.y = PATH_POINTS[-1]
+            return True
+        remaining = self.travelled
+        for index, segment_length in enumerate(self.path_lengths):
+            if remaining <= segment_length:
+                ax, ay = PATH_POINTS[index]
+                bx, by = PATH_POINTS[index + 1]
+                ratio = remaining / segment_length if segment_length else 0.0
+                self.x = ax + (bx - ax) * ratio
+                self.y = ay + (by - ay) * ratio
+                break
+            remaining -= segment_length
+        return False
+
+
+class Tower:
+    def __init__(self, kind, x, y):
+        self.kind = kind
+        self.x = x
+        self.y = y
+        self.level = 1
+        self.cooldown = random.random() * 0.25
+        self.info = TOWER_TYPES[kind]
+
+    @property
+    def attack_range(self):
+        return self.info["range"] + (self.level - 1) * 12
+
+    @property
+    def damage(self):
+        return self.info["damage"] * (1.0 + (self.level - 1) * 0.38)
+
+    @property
+    def attack_rate(self):
+        return self.info["rate"] * (0.91 ** (self.level - 1))
+
+    def upgrade_cost(self):
+        return int(self.info["cost"] * 0.65 + self.level * 32)
+
+    def sell_value(self):
+        invested = self.info["cost"]
+        for level in range(1, self.level):
+            invested += int(self.info["cost"] * 0.65 + level * 32)
+        return int(invested * 0.68)
+
+
+class Projectile:
+    def __init__(self, x, y, target, damage, kind):
+        self.x = x
+        self.y = y
+        self.target = target
+        self.damage = damage
+        self.kind = kind
+        self.speed = 510 if kind == "archer" else 370
+        self.alive = True
+
+
+class TowerDefenseGame:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(WINDOW_TITLE)
+        self.root.resizable(False, False)
+        self.root.configure(bg="#16211f")
+
+        self.canvas = tk.Canvas(
+            root, width=FIELD_W, height=FIELD_H,
+            bg="#73966c", highlightthickness=0,
+        )
+        self.canvas.grid(row=0, column=0, rowspan=2, padx=(12, 8), pady=12)
+        self.panel_view = tk.Frame(root, width=270, height=FIELD_H, bg="#1d2c2a")
+        self.panel_view.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=12)
+        self.panel_view.grid_propagate(False)
+        self.sidebar_canvas = tk.Canvas(
+            self.panel_view, width=250, height=FIELD_H, bg="#1d2c2a", highlightthickness=0,
+        )
+        self.sidebar_scrollbar = tk.Scrollbar(
+            self.panel_view, orient="vertical", command=self.sidebar_canvas.yview,
+        )
+        self.sidebar_canvas.configure(yscrollcommand=self.sidebar_scrollbar.set)
+        self.sidebar_canvas.pack(side="left", fill="both", expand=True)
+        self.sidebar_scrollbar.pack(side="right", fill="y")
+        self.panel = tk.Frame(self.sidebar_canvas, bg="#1d2c2a", padx=14, pady=12)
+        self.sidebar_canvas.create_window((0, 0), window=self.panel, anchor="nw", width=250)
+        self.panel.bind(
+            "<Configure>",
+            lambda _event: self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all")),
+        )
+
+        self._build_panel()
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<Motion>", self.on_canvas_motion)
+
+        self.high_score = self.load_high_score()
+        self.decorations = self.make_decorations()
+        self.reset_game()
+        self.last_tick = time.time()
+        self.root.after(30, self.tick)
+
+    def _build_panel(self):
+        tk.Label(
+            self.panel, text="KULE SAVUNMASI", bg="#1d2c2a", fg="#f1f4e9",
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            self.panel, text="Üssünü koru, dalgaları durdur.", bg="#1d2c2a",
+            fg="#afc0b4", font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(1, 13))
+
+        self.money_var = tk.StringVar()
+        self.health_var = tk.StringVar()
+        self.wave_var = tk.StringVar()
+        self.score_var = tk.StringVar()
+        self.record_var = tk.StringVar()
+        self.status_var = tk.StringVar()
+        for variable, color in [
+            (self.money_var, "#f5c451"), (self.health_var, "#ef7777"),
+            (self.wave_var, "#f1f4e9"), (self.score_var, "#f1f4e9"),
+            (self.record_var, "#afc0b4"),
+        ]:
+            tk.Label(
+                self.panel, textvariable=variable, bg="#1d2c2a", fg=color,
+                font=("Segoe UI", 11, "bold"), anchor="w",
+            ).pack(fill="x", pady=2)
+
+        self._separator()
+        tk.Label(
+            self.panel, text="SAVUNMA KULELERİ", bg="#1d2c2a", fg="#dce6d8",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 7))
+        self.tower_buttons = {}
+        for kind in ("archer", "cannon", "frost"):
+            info = TOWER_TYPES[kind]
+            button = tk.Button(
+                self.panel,
+                text=f"{info['name']}  •  {info['cost']}₺\n{info['description']}",
+                command=lambda tower_kind=kind: self.choose_tower(tower_kind),
+                bg="#314541", fg="#f1f4e9", activebackground="#45615a",
+                activeforeground="white", relief="flat", justify="left",
+                anchor="w", font=("Segoe UI", 9, "bold"), padx=9, pady=6,
+                cursor="hand2",
+            )
+            button.pack(fill="x", pady=3)
+            self.tower_buttons[kind] = button
+
+        self._separator()
+        self.wave_button = self._button("Sonraki Dalgayı Başlat", self.start_wave, "#a9553b")
+        self.pause_button = self._button("Oyunu Duraklat", self.toggle_pause, "#526c60")
+        self._button("Oyunu Yeniden Başlat", self.restart, "#3a4d48")
+        self.save_button = self._button("Oyunu Kaydet", self.save_game, "#3a4d48")
+        self.load_button = self._button("Kaydı Yükle", self.load_game, "#3a4d48")
+
+        self._separator()
+        tk.Label(
+            self.panel, text="SEÇİLİ KULE", bg="#1d2c2a", fg="#dce6d8",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 5))
+        self.selected_var = tk.StringVar(value="Haritaya kule yerleştir veya mevcut kuleye tıkla.")
+        tk.Label(
+            self.panel, textvariable=self.selected_var, bg="#1d2c2a", fg="#afc0b4",
+            font=("Segoe UI", 9), justify="left", anchor="w", wraplength=240,
+            height=3,
+        ).pack(fill="x")
+        self.upgrade_button = self._button("Kuleyi Yükselt", self.upgrade_selected, "#8b7140")
+        self.sell_button = self._button("Kuleyi Sat", self.sell_selected, "#704d4a")
+        self._separator()
+        self.status_label = tk.Label(
+            self.panel, textvariable=self.status_var, bg="#1d2c2a", fg="#f1d58a",
+            font=("Segoe UI", 9), justify="left", anchor="nw", wraplength=240,
+        )
+        self.status_label.pack(fill="x", pady=(2, 7))
+        tk.Label(
+            self.panel, text="İpucu: Kuleleri yolun kıvrımlarına yakın kur.",
+            bg="#1d2c2a", fg="#82988b", font=("Segoe UI", 8), justify="left",
+            wraplength=240,
+        ).pack(anchor="w", side="bottom", pady=(8, 0))
+
+    def _button(self, label, command, color):
+        button = tk.Button(
+            self.panel, text=label, command=command, bg=color, fg="white",
+            activebackground="#6b8376", activeforeground="white", relief="flat",
+            font=("Segoe UI", 9, "bold"), pady=7, cursor="hand2",
+        )
+        button.pack(fill="x", pady=3)
+        return button
+
+    def _separator(self):
+        tk.Frame(self.panel, bg="#354741", height=1).pack(fill="x", pady=10)
+
+    def make_decorations(self):
+        random.seed(18)
+        items = []
+        for _ in range(34):
+            x = random.randint(20, FIELD_W - 20)
+            y = random.randint(20, FIELD_H - 20)
+            near_road = any(
+                distance_to_segment(x, y, *PATH_POINTS[i], *PATH_POINTS[i + 1]) < 52
+                for i in range(len(PATH_POINTS) - 1)
+            )
+            if not near_road:
+                items.append((x, y, random.choice(["tree", "rock", "bush"])))
+        random.seed()
+        return items
+
+    def load_high_score(self):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as file:
+                return int(json.load(file).get("high_score", 0))
+        except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+            return 0
+
+    def store_high_score(self):
+        try:
+            with open(DATA_FILE, "w", encoding="utf-8") as file:
+                json.dump({"high_score": self.high_score}, file, ensure_ascii=False, indent=2)
+        except OSError:
+            self.status_var.set("Rekor dosyası yazılamadı; oyun devam ediyor.")
+
+    def reset_game(self):
+        self.money = 190
+        self.base_health = 20
+        self.wave = 0
+        self.score = 0
+        self.towers = []
+        self.enemies = []
+        self.projectiles = []
+        self.spawn_queue = []
+        self.spawn_timer = 0.0
+        self.wave_active = False
+        self.paused = False
+        self.game_over = False
+        self.build_kind = None
+        self.selected_tower = None
+        self.mouse_x, self.mouse_y = -100, -100
+        self.message = "Bir kule seç, sonra haritaya tıklayarak yerleştir."
+        self.path_lengths = [
+            math.hypot(PATH_POINTS[i + 1][0] - PATH_POINTS[i][0],
+                       PATH_POINTS[i + 1][1] - PATH_POINTS[i][1])
+            for i in range(len(PATH_POINTS) - 1)
+        ]
+        self.total_path_length = sum(self.path_lengths)
+        self.refresh_panel()
+
+    def restart(self):
+        self.reset_game()
+        self.message = "Yeni oyun başladı. Savunmanı kur!"
+        self.refresh_panel()
+
+    def choose_tower(self, kind):
+        if self.paused or self.game_over:
+            return
+        cost = TOWER_TYPES[kind]["cost"]
+        if self.money < cost:
+            self.message = f"{TOWER_TYPES[kind]['name']} için {cost}₺ gerekiyor."
+            self.build_kind = None
+        else:
+            self.build_kind = kind
+            self.selected_tower = None
+            self.message = f"{TOWER_TYPES[kind]['name']} için uygun bir noktaya tıkla."
+        self.refresh_panel()
+
+    def on_canvas_motion(self, event):
+        self.mouse_x, self.mouse_y = event.x, event.y
+
+    def on_canvas_click(self, event):
+        if self.paused or self.game_over:
+            return
+        x, y = event.x, event.y
+        if self.build_kind:
+            self.place_tower(self.build_kind, x, y)
+            return
+        nearest = None
+        nearest_distance = 28
+        for tower in self.towers:
+            distance = math.hypot(tower.x - x, tower.y - y)
+            if distance < nearest_distance:
+                nearest = tower
+                nearest_distance = distance
+        self.selected_tower = nearest
+        self.message = "Kule seçildi." if nearest else "Bir kule seç veya yeni kule yerleştir."
+        self.refresh_panel()
+
+    def valid_tower_position(self, x, y):
+        margin = 27
+        if not (margin <= x <= FIELD_W - margin and margin <= y <= FIELD_H - margin):
+            return False
+        if any(distance_to_segment(x, y, *PATH_POINTS[i], *PATH_POINTS[i + 1]) < 39
+               for i in range(len(PATH_POINTS) - 1)):
+            return False
+        if any(math.hypot(x - tower.x, y - tower.y) < 48 for tower in self.towers):
+            return False
+        return True
+
+    def place_tower(self, kind, x, y):
+        if not self.valid_tower_position(x, y):
+            self.message = "Buraya kule kurulamaz; yoldan ve diğer kulelerden uzaklaş."
+            return
+        cost = TOWER_TYPES[kind]["cost"]
+        if self.money < cost:
+            self.message = "Yeterli paran yok."
+            self.build_kind = None
+            return
+        self.money -= cost
+        tower = Tower(kind, x, y)
+        self.towers.append(tower)
+        self.selected_tower = tower
+        self.build_kind = None
+        self.message = f"{tower.info['name']} kuruldu."
+        self.refresh_panel()
+
+    def start_wave(self):
+        if self.paused or self.game_over or self.wave_active:
+            return
+        self.wave += 1
+        count = 5 + self.wave * 2
+        available = ["scout"]
+        if self.wave >= 2:
+            available.append("runner")
+        if self.wave >= 3:
+            available.append("brute")
+        if self.wave >= 4:
+            available.append("armored")
+        self.spawn_queue = [random.choice(available) for _ in range(count)]
+        if self.wave % 5 == 0:
+            self.spawn_queue.append("boss")
+        self.spawn_timer = 0.0
+        self.wave_active = True
+        self.message = f"{self.wave}. dalga başladı! Düşman sayısı: {len(self.spawn_queue)}."
+        self.refresh_panel()
+
+    def toggle_pause(self):
+        if self.game_over:
+            return
+        self.paused = not self.paused
+        self.message = "Oyun duraklatıldı." if self.paused else "Oyun devam ediyor."
+        self.last_tick = time.time()
+        self.refresh_panel()
+
+    def upgrade_selected(self):
+        tower = self.selected_tower
+        if not tower or tower.level >= 4 or self.paused or self.game_over:
+            return
+        cost = tower.upgrade_cost()
+        if self.money < cost:
+            self.message = f"Yükseltme için {cost}₺ gerekiyor."
+            return
+        self.money -= cost
+        tower.level += 1
+        self.message = f"{tower.info['name']} {tower.level}. seviyeye yükseltildi."
+        self.refresh_panel()
+
+    def sell_selected(self):
+        tower = self.selected_tower
+        if not tower:
+            return
+        value = tower.sell_value()
+        self.money += value
+        self.towers.remove(tower)
+        self.selected_tower = None
+        self.message = f"Kule satıldı; {value}₺ kazandın."
+        self.refresh_panel()
+
+    def save_game(self):
+        if self.wave_active:
+            self.message = "Kayıt yalnızca dalgalar arasında alınabilir."
+            self.refresh_panel()
+            return
+        data = {
+            "money": self.money,
+            "base_health": self.base_health,
+            "wave": self.wave,
+            "score": self.score,
+            "towers": [
+                {"kind": tower.kind, "x": tower.x, "y": tower.y, "level": tower.level}
+                for tower in self.towers
+            ],
+        }
+        try:
+            with open("tower_defense_save.json", "w", encoding="utf-8") as file:
+                json.dump(data, file, ensure_ascii=False, indent=2)
+            self.message = "Oyun kaydedildi. Yükleme, dalgalar arasındaki durumu geri getirir."
+        except OSError:
+            self.message = "Kayıt dosyası yazılamadı."
+        self.refresh_panel()
+
+    def load_game(self):
+        try:
+            with open("tower_defense_save.json", "r", encoding="utf-8") as file:
+                data = json.load(file)
+            towers = []
+            for saved in data.get("towers", []):
+                if saved.get("kind") not in TOWER_TYPES:
+                    continue
+                tower = Tower(saved["kind"], float(saved["x"]), float(saved["y"]))
+                tower.level = max(1, min(4, int(saved.get("level", 1))))
+                if self._position_valid_against(tower.x, tower.y, towers):
+                    towers.append(tower)
+            self.money = max(0, int(data.get("money", 190)))
+            self.base_health = max(1, min(20, int(data.get("base_health", 20))))
+            self.wave = max(0, int(data.get("wave", 0)))
+            self.score = max(0, int(data.get("score", 0)))
+            self.towers = towers
+            self.enemies = []
+            self.projectiles = []
+            self.spawn_queue = []
+            self.wave_active = False
+            self.game_over = False
+            self.paused = False
+            self.selected_tower = None
+            self.build_kind = None
+            self.message = "Kayıt yüklendi. Sonraki dalgayı başlatabilirsin."
+        except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+            self.message = "Yüklenecek kayıt bulunamadı veya kayıt dosyası bozuk."
+        self.refresh_panel()
+
+    def _position_valid_against(self, x, y, towers):
+        margin = 27
+        if not (margin <= x <= FIELD_W - margin and margin <= y <= FIELD_H - margin):
+            return False
+        if any(distance_to_segment(x, y, *PATH_POINTS[i], *PATH_POINTS[i + 1]) < 39
+               for i in range(len(PATH_POINTS) - 1)):
+            return False
+        return not any(math.hypot(x - tower.x, y - tower.y) < 48 for tower in towers)
+
+    def update_game(self, dt, now):
+        if self.wave_active:
+            self.spawn_timer -= dt
+            if self.spawn_queue and self.spawn_timer <= 0:
+                kind = self.spawn_queue.pop(0)
+                self.enemies.append(Enemy(kind, self.wave, self.path_lengths, self.total_path_length))
+                self.spawn_timer = max(0.36, 0.82 - self.wave * 0.015)
+
+        for enemy in self.enemies:
+            reached_base = enemy.update(dt, now)
+            if reached_base and enemy.alive:
+                enemy.alive = False
+                self.base_health -= enemy.base_damage
+                self.message = f"{enemy.name} üsse ulaştı! Üs -{enemy.base_damage} can."
+                if self.base_health <= 0:
+                    self.base_health = 0
+                    self.finish_game()
+
+        for tower in self.towers:
+            tower.cooldown -= dt
+            if tower.cooldown > 0:
+                continue
+            candidates = [
+                enemy for enemy in self.enemies
+                if enemy.alive and math.hypot(enemy.x - tower.x, enemy.y - tower.y) <= tower.attack_range
+            ]
+            if not candidates:
+                continue
+            target = max(candidates, key=lambda enemy: enemy.travelled)
+            tower.cooldown = tower.attack_rate
+            if tower.kind == "frost":
+                self.damage_enemy(target, tower.damage)
+                if target.alive:
+                    target.slow_until = now + 1.7
+                    target.slow_factor = 0.55
+            else:
+                self.projectiles.append(Projectile(tower.x, tower.y, target, tower.damage, tower.kind))
+
+        for projectile in self.projectiles:
+            self.update_projectile(projectile, dt)
+
+        self.enemies = [enemy for enemy in self.enemies if enemy.alive]
+        self.projectiles = [projectile for projectile in self.projectiles if projectile.alive]
+        if self.wave_active and not self.game_over and not self.spawn_queue and not self.enemies:
+            self.wave_active = False
+            bonus = 22 + self.wave * 5
+            self.money += bonus
+            self.score += bonus
+            if self.score > self.high_score:
+                self.high_score = self.score
+                self.store_high_score()
+            self.message = f"Dalga temizlendi! {bonus}₺ dalga ödülü kazandın."
+            self.refresh_panel()
+
+    def update_projectile(self, projectile, dt):
+        target = projectile.target
+        if not target.alive:
+            projectile.alive = False
+            return
+        dx = target.x - projectile.x
+        dy = target.y - projectile.y
+        distance = math.hypot(dx, dy)
+        step = projectile.speed * dt
+        if distance <= step or distance == 0:
+            projectile.x, projectile.y = target.x, target.y
+            projectile.alive = False
+            if projectile.kind == "cannon":
+                for enemy in self.enemies:
+                    if enemy.alive and math.hypot(enemy.x - target.x, enemy.y - target.y) <= 54:
+                        self.damage_enemy(enemy, projectile.damage if enemy is target else projectile.damage * 0.58)
+            else:
+                self.damage_enemy(target, projectile.damage)
+            return
+        projectile.x += dx / distance * step
+        projectile.y += dy / distance * step
+
+    def damage_enemy(self, enemy, damage):
+        if not enemy.alive:
+            return
+        enemy.health -= max(1, damage - enemy.armor)
+        if enemy.health <= 0:
+            enemy.alive = False
+            self.money += enemy.reward
+            self.score += enemy.reward
+            if self.score > self.high_score:
+                self.high_score = self.score
+                self.store_high_score()
+
+    def finish_game(self):
+        if self.game_over:
+            return
+        self.game_over = True
+        self.paused = False
+        self.build_kind = None
+        self.message = f"Üs düştü! Skorun: {self.score}. Yeniden başlatarak tekrar dene."
+        if self.score > self.high_score:
+            self.high_score = self.score
+            self.store_high_score()
+        self.refresh_panel()
+
+    def refresh_panel(self):
+        self.money_var.set(f"PARA     {self.money}₺")
+        self.health_var.set(f"ÜS CANI     {self.base_health} / 20")
+        self.wave_var.set(f"DALGA     {self.wave}")
+        self.score_var.set(f"SKOR     {self.score}")
+        self.record_var.set(f"EN İYİ SKOR     {self.high_score}")
+        self.status_var.set(self.message)
+        if self.wave_active:
+            self.wave_button.configure(text=f"Dalga sürüyor ({len(self.spawn_queue)} bekliyor)", state="disabled")
+        elif self.game_over:
+            self.wave_button.configure(text="Üs Düştü", state="disabled")
+        elif self.paused:
+            self.wave_button.configure(text="Dalga Başlat", state="disabled")
+        else:
+            self.wave_button.configure(text="Sonraki Dalgayı Başlat", state="normal")
+        self.pause_button.configure(text="Devam Et" if self.paused else "Oyunu Duraklat")
+        self.save_button.configure(state="disabled" if self.wave_active or self.game_over else "normal")
+        for kind, button in self.tower_buttons.items():
+            button.configure(state="normal" if self.money >= TOWER_TYPES[kind]["cost"] and not self.paused and not self.game_over else "disabled")
+        tower = self.selected_tower
+        if tower and tower in self.towers:
+            self.selected_var.set(
+                f"{tower.info['name']} • Seviye {tower.level}\n"
+                f"Hasar: {tower.damage:.0f}   Menzil: {tower.attack_range:.0f}\n"
+                f"Saldırı aralığı: {tower.attack_rate:.2f} sn"
+            )
+            self.upgrade_button.configure(
+                text=(f"Yükselt • {tower.upgrade_cost()}₺" if tower.level < 4 else "Maksimum Seviye"),
+                state="normal" if tower.level < 4 and self.money >= tower.upgrade_cost() and not self.paused and not self.game_over else "disabled",
+            )
+            self.sell_button.configure(state="normal" if not self.game_over else "disabled")
+        else:
+            self.selected_var.set("Haritaya kule yerleştir veya mevcut kuleye tıkla.")
+            self.upgrade_button.configure(text="Kuleyi Yükselt", state="disabled")
+            self.sell_button.configure(text="Kuleyi Sat", state="disabled")
+
+    def tick(self):
+        now = time.time()
+        dt = min(0.06, max(0.0, now - self.last_tick))
+        self.last_tick = now
+        if not self.paused and not self.game_over:
+            self.update_game(dt, now)
+        self.refresh_panel()
+        self.draw()
+        self.root.after(30, self.tick)
+
+    def draw(self):
+        self.canvas.delete("all")
+        self.canvas.create_rectangle(0, 0, FIELD_W, FIELD_H, fill="#78996e", outline="")
+        for x in range(0, FIELD_W, 40):
+            for y in range(0, FIELD_H, 40):
+                self.canvas.create_rectangle(x, y, x + 1, y + 1, fill="#88a77a", outline="")
+        for x, y, kind in self.decorations:
+            if kind == "tree":
+                self.canvas.create_oval(x - 9, y - 5, x + 9, y + 13, fill="#416e4d", outline="")
+                self.canvas.create_oval(x - 7, y - 13, x + 7, y + 3, fill="#4f8056", outline="")
+            elif kind == "rock":
+                self.canvas.create_oval(x - 6, y - 4, x + 7, y + 5, fill="#87927b", outline="#6d7968")
+            else:
+                self.canvas.create_oval(x - 7, y - 5, x + 7, y + 5, fill="#5c8a58", outline="")
+
+        points = [coordinate for point in PATH_POINTS for coordinate in point]
+        self.canvas.create_line(*points, fill="#695641", width=43, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        self.canvas.create_line(*points, fill="#cbb58a", width=34, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        self.canvas.create_line(*points, fill="#d9c69f", width=2, dash=(4, 10))
+
+        sx, sy = PATH_POINTS[0]
+        self.canvas.create_oval(sx + 6, sy - 19, sx + 43, sy + 19, fill="#385849", outline="#d6e1c7", width=2)
+        self.canvas.create_text(sx + 24, sy, text="GİRİŞ", fill="white", font=("Segoe UI", 8, "bold"))
+        bx, by = PATH_POINTS[-1]
+        self.canvas.create_rectangle(bx - 50, by - 33, bx - 9, by + 33, fill="#7c3339", outline="#f1d7ac", width=2)
+        self.canvas.create_text(bx - 29, by, text="ÜS", fill="white", font=("Segoe UI", 10, "bold"))
+
+        for tower in self.towers:
+            self.draw_tower(tower)
+        for projectile in self.projectiles:
+            color = "#ffd166" if projectile.kind == "archer" else "#f28c5b"
+            radius = 4 if projectile.kind == "archer" else 6
+            self.canvas.create_oval(projectile.x - radius, projectile.y - radius,
+                                    projectile.x + radius, projectile.y + radius,
+                                    fill=color, outline="#fff1c9")
+        for enemy in self.enemies:
+            self.draw_enemy(enemy)
+
+        if self.build_kind:
+            kind = self.build_kind
+            info = TOWER_TYPES[kind]
+            valid = self.valid_tower_position(self.mouse_x, self.mouse_y)
+            color = "#baf0c2" if valid else "#f08b82"
+            self.canvas.create_oval(
+                self.mouse_x - info["range"], self.mouse_y - info["range"],
+                self.mouse_x + info["range"], self.mouse_y + info["range"],
+                outline=color, dash=(3, 4), width=2,
+            )
+            self.canvas.create_oval(self.mouse_x - 15, self.mouse_y - 15,
+                                    self.mouse_x + 15, self.mouse_y + 15,
+                                    fill=info["color"], stipple="gray50", outline=color, width=2)
+
+        self.canvas.create_rectangle(12, 12, 208, 42, fill="#243a32", outline="#bac9ac")
+        state = "DURAKLATILDI" if self.paused else ("OYUN BİTTİ" if self.game_over else "SAVUNMA HATTI")
+        self.canvas.create_text(22, 27, text=state, anchor="w", fill="#f3f1df", font=("Segoe UI", 10, "bold"))
+        if self.paused or self.game_over:
+            overlay = "DURAKLATILDI" if self.paused else "ÜS DÜŞTÜ"
+            self.canvas.create_rectangle(210, 260, 610, 340, fill="#17211f", stipple="gray50", outline="#f1d58a", width=2)
+            self.canvas.create_text(410, 300, text=overlay, fill="white", font=("Segoe UI", 24, "bold"))
+
+    def draw_tower(self, tower):
+        info = tower.info
+        if tower is self.selected_tower:
+            self.canvas.create_oval(
+                tower.x - tower.attack_range, tower.y - tower.attack_range,
+                tower.x + tower.attack_range, tower.y + tower.attack_range,
+                outline="#fff2b2", dash=(5, 4), width=2,
+            )
+        self.canvas.create_oval(tower.x - 19, tower.y - 15, tower.x + 19, tower.y + 21,
+                                fill="#344a40", outline="#263b34", width=2)
+        self.canvas.create_oval(tower.x - 16, tower.y - 19, tower.x + 16, tower.y + 13,
+                                fill=info["color"], outline="#eff0d5", width=2)
+        self.canvas.create_text(tower.x, tower.y - 3, text=info["short"], fill="white",
+                                font=("Segoe UI", 12, "bold"))
+        if tower.level > 1:
+            self.canvas.create_oval(tower.x + 9, tower.y + 7, tower.x + 23, tower.y + 21,
+                                    fill="#e6bd56", outline="#fff0b2")
+            self.canvas.create_text(tower.x + 16, tower.y + 14, text=str(tower.level),
+                                    fill="#3b3524", font=("Segoe UI", 8, "bold"))
+
+    def draw_enemy(self, enemy):
+        radius = 15 if enemy.kind == "boss" else (12 if enemy.kind in ("brute", "armored") else 10)
+        self.canvas.create_oval(enemy.x - radius + 2, enemy.y - radius + 4,
+                                enemy.x + radius + 2, enemy.y + radius + 4,
+                                fill="#455443", outline="")
+        self.canvas.create_oval(enemy.x - radius, enemy.y - radius,
+                                enemy.x + radius, enemy.y + radius,
+                                fill=enemy.color, outline="#fff0d6", width=1)
+        if enemy.kind == "boss":
+            self.canvas.create_text(enemy.x, enemy.y, text="!", fill="white", font=("Segoe UI", 13, "bold"))
+        ratio = max(0.0, enemy.health / enemy.max_health)
+        bar_width = radius * 2 + 6
+        left = enemy.x - bar_width / 2
+        top = enemy.y - radius - 9
+        self.canvas.create_rectangle(left, top, left + bar_width, top + 5, fill="#542c31", outline="")
+        bar_color = "#77d17c" if ratio > 0.55 else ("#e6c85d" if ratio > 0.25 else "#ed7167")
+        self.canvas.create_rectangle(left, top, left + bar_width * ratio, top + 5, fill=bar_color, outline="")
+
+
+def main():
+    root = tk.Tk()
+    TowerDefenseGame(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
