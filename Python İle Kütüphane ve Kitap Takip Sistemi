@@ -1,0 +1,641 @@
+from __future__ import annotations
+
+import logging
+import sqlite3
+import tkinter as tk
+from collections.abc import Callable
+from pathlib import Path
+from tkinter import messagebox, ttk
+from typing import Any
+
+from library import LibrarySystem
+
+
+_FAILED = object()
+
+
+class LibraryApp:
+    """Desktop interface backed by a SQLite library database."""
+
+    def __init__(self, library: LibrarySystem) -> None:
+        self.library = library
+        self.root = tk.Tk()
+        self.root.title("Kütüphane ve Kitap Takip Sistemi")
+        self.root.geometry("1120x700")
+        self.root.minsize(850, 520)
+        self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
+        self._build_interface()
+        self.refresh_all()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    def _build_interface(self) -> None:
+        frame = ttk.Frame(self.root, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text="Kütüphane ve Kitap Takip Sistemi",
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="w", pady=(0, 12))
+
+        notebook = ttk.Notebook(frame)
+        notebook.pack(fill="both", expand=True)
+        self.books_tab = ttk.Frame(notebook, padding=10)
+        self.members_tab = ttk.Frame(notebook, padding=10)
+        self.loans_tab = ttk.Frame(notebook, padding=10)
+        self.overdue_tab = ttk.Frame(notebook, padding=10)
+        self.stats_tab = ttk.Frame(notebook, padding=10)
+        for tab, title in (
+            (self.books_tab, "Kitaplar"),
+            (self.members_tab, "Üyeler"),
+            (self.loans_tab, "Ödünç İşlemleri"),
+            (self.overdue_tab, "Gecikenler"),
+            (self.stats_tab, "İstatistikler"),
+        ):
+            notebook.add(tab, text=title)
+        self._build_books_tab()
+        self._build_members_tab()
+        self._build_loans_tab()
+        self._build_overdue_tab()
+        self._build_stats_tab()
+
+    @staticmethod
+    def _create_table(
+        parent: ttk.Frame, columns: list[tuple[str, str, int]]
+    ) -> ttk.Treeview:
+        container = ttk.Frame(parent)
+        container.pack(fill="both", expand=True)
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(
+            container, columns=[column[0] for column in columns], show="headings"
+        )
+        for key, title, width in columns:
+            tree.heading(key, text=title)
+            tree.column(key, width=width, minwidth=70, anchor="w")
+        vertical = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
+        horizontal = ttk.Scrollbar(container, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        return tree
+
+    @staticmethod
+    def _add_button(
+        parent: ttk.Frame, label: str, command: Callable[[], None], side: str = "right"
+    ) -> None:
+        ttk.Button(parent, text=label, command=command).pack(
+            side=side, padx=(6, 0)
+        )
+
+    def _build_books_tab(self) -> None:
+        controls = ttk.Frame(self.books_tab)
+        controls.pack(fill="x", pady=(0, 10))
+        self.book_search = tk.StringVar()
+        ttk.Label(controls, text="Kitap adı veya yazar:").pack(side="left")
+        entry = ttk.Entry(controls, textvariable=self.book_search, width=25)
+        entry.pack(side="left", padx=6)
+        entry.bind("<Return>", lambda _event: self._search_books())
+        ttk.Button(controls, text="Ara", command=self._search_books).pack(side="left")
+        ttk.Button(
+            controls, text="Tümünü Göster", command=self._clear_book_search
+        ).pack(side="left", padx=6)
+        for label, command in (
+            ("Kitap Ekle", self._add_book),
+            ("Düzenle", self._edit_book),
+            ("Sil", self._delete_book),
+        ):
+            self._add_button(controls, label, command)
+        self.books_tree = self._create_table(
+            self.books_tab,
+            [
+                ("id", "ID", 55),
+                ("title", "Kitap adı", 250),
+                ("author", "Yazar", 180),
+                ("isbn", "ISBN", 145),
+                ("year", "Yayın yılı", 90),
+                ("status", "Durum", 100),
+            ],
+        )
+
+    def _build_members_tab(self) -> None:
+        controls = ttk.Frame(self.members_tab)
+        controls.pack(fill="x", pady=(0, 10))
+        self.member_search = tk.StringVar()
+        ttk.Label(controls, text="Üye adı:").pack(side="left")
+        entry = ttk.Entry(controls, textvariable=self.member_search, width=25)
+        entry.pack(side="left", padx=6)
+        entry.bind("<Return>", lambda _event: self._search_members())
+        ttk.Button(controls, text="Ara", command=self._search_members).pack(side="left")
+        ttk.Button(
+            controls, text="Tümünü Göster", command=self._clear_member_search
+        ).pack(side="left", padx=6)
+        for label, command in (
+            ("Üye Ekle", self._add_member),
+            ("Düzenle", self._edit_member),
+            ("Sil", self._delete_member),
+            ("Ödünç Aldıkları", self._show_member_loans),
+        ):
+            self._add_button(controls, label, command)
+        self.members_tree = self._create_table(
+            self.members_tab,
+            [
+                ("id", "ID", 55),
+                ("name", "Ad soyad", 240),
+                ("phone", "Telefon", 150),
+                ("email", "E-posta", 240),
+                ("registered", "Kayıt tarihi", 120),
+            ],
+        )
+
+    def _build_loans_tab(self) -> None:
+        controls = ttk.Frame(self.loans_tab)
+        controls.pack(fill="x", pady=(0, 10))
+        self._add_button(controls, "Yenile", self.refresh_loans)
+        self._add_button(controls, "Seçili Kitabı İade Al", self._return_book, "left")
+        self._add_button(controls, "Kitap Ödünç Ver", self._loan_book, "left")
+        self.loans_tree = self._create_table(
+            self.loans_tab,
+            [
+                ("loan_id", "İşlem ID", 75),
+                ("book_id", "Kitap ID", 75),
+                ("title", "Kitap", 220),
+                ("member_id", "Üye ID", 75),
+                ("name", "Üye", 190),
+                ("loan_date", "Alış tarihi", 110),
+                ("due_date", "Son iade tarihi", 120),
+            ],
+        )
+
+    def _build_overdue_tab(self) -> None:
+        controls = ttk.Frame(self.overdue_tab)
+        controls.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            controls, text="İade tarihi geçmiş ve henüz iade edilmemiş kitaplar."
+        ).pack(side="left")
+        self._add_button(controls, "Yenile", self.refresh_overdue)
+        self.overdue_tree = self._create_table(
+            self.overdue_tab,
+            [
+                ("loan_id", "İşlem ID", 75),
+                ("title", "Kitap", 250),
+                ("name", "Üye", 200),
+                ("loan_date", "Alış tarihi", 120),
+                ("due_date", "Son iade tarihi", 140),
+            ],
+        )
+
+    def _build_stats_tab(self) -> None:
+        controls = ttk.Frame(self.stats_tab)
+        controls.pack(fill="x", pady=(0, 10))
+        ttk.Button(
+            controls, text="İstatistikleri Yenile", command=self.refresh_statistics
+        ).pack(side="left")
+        self.stats_text = tk.Text(
+            self.stats_tab,
+            height=18,
+            wrap="word",
+            font=("Segoe UI", 12),
+            state="disabled",
+        )
+        self.stats_text.pack(fill="both", expand=True)
+
+    @staticmethod
+    def _replace_rows(
+        tree: ttk.Treeview,
+        rows: list[Any],
+        values_for_row: Callable[[Any], tuple[Any, ...]],
+    ) -> None:
+        tree.delete(*tree.get_children())
+        for row in rows:
+            tree.insert("", "end", values=values_for_row(row))
+
+    def _perform(self, operation: Callable[[], Any]) -> Any:
+        try:
+            return operation()
+        except (ValueError, LookupError) as error:
+            messagebox.showwarning("İşlem yapılamadı", str(error), parent=self.root)
+        except sqlite3.Error:
+            logging.exception("Veritabanı işlemi başarısız oldu.")
+            messagebox.showerror(
+                "Veritabanı hatası",
+                "Ayrıntılar logs/library.log dosyasına yazıldı.",
+                parent=self.root,
+            )
+        return _FAILED
+
+    def refresh_all(self) -> None:
+        self.refresh_books()
+        self.refresh_members()
+        self.refresh_loans()
+        self.refresh_overdue()
+        self.refresh_statistics()
+
+    def refresh_books(self) -> None:
+        rows = self._perform(self.library.list_books)
+        if rows is not _FAILED:
+            self._replace_rows(
+                self.books_tree,
+                rows,
+                lambda row: (
+                    row["id"],
+                    row["title"],
+                    row["author"],
+                    row["isbn"] or "-",
+                    row["publish_year"] or "-",
+                    "Mevcut" if row["available"] else "Ödünçte",
+                ),
+            )
+
+    def refresh_members(self) -> None:
+        rows = self._perform(self.library.list_members)
+        if rows is not _FAILED:
+            self._replace_rows(
+                self.members_tree,
+                rows,
+                lambda row: (
+                    row["id"],
+                    row["name"],
+                    row["phone"] or "-",
+                    row["email"] or "-",
+                    row["registration_date"],
+                ),
+            )
+
+    def refresh_loans(self) -> None:
+        rows = self._perform(self.library.active_loans)
+        if rows is not _FAILED:
+            self._replace_rows(
+                self.loans_tree,
+                rows,
+                lambda row: (
+                    row["loan_id"],
+                    row["book_id"],
+                    row["title"],
+                    row["member_id"],
+                    row["name"],
+                    row["loan_date"],
+                    row["due_date"],
+                ),
+            )
+
+    def refresh_overdue(self) -> None:
+        rows = self._perform(self.library.overdue_loans)
+        if rows is not _FAILED:
+            self._replace_rows(
+                self.overdue_tree,
+                rows,
+                lambda row: (
+                    row["loan_id"],
+                    row["title"],
+                    row["name"],
+                    row["loan_date"],
+                    row["due_date"],
+                ),
+            )
+
+    def refresh_statistics(self) -> None:
+        stats = self._perform(self.library.statistics)
+        if stats is _FAILED:
+            return
+        lines = [
+            "KÜTÜPHANE İSTATİSTİKLERİ",
+            "",
+            f'Toplam kitap: {stats["total_books"]}',
+            f'Mevcut kitap: {stats["available_books"]}',
+            f'Ödünçteki kitap: {stats["borrowed_books"]}',
+            f'Toplam üye: {stats["total_members"]}',
+            f'Aktif ödünç işlemi: {stats["active_loans"]}',
+            f'Geciken kitap: {stats["overdue_books"]}',
+            "",
+            "En çok ödünç alınan kitaplar:",
+        ]
+        popular = [book for book in stats["popular_books"] if book["loan_count"] > 0]
+        lines.extend(
+            f'  {book["title"]} — {book["loan_count"]} kez' for book in popular
+        )
+        if not popular:
+            lines.append("  Henüz ödünç alma kaydı yok.")
+        self.stats_text.configure(state="normal")
+        self.stats_text.delete("1.0", "end")
+        self.stats_text.insert("1.0", "\n".join(lines))
+        self.stats_text.configure(state="disabled")
+
+    def _selected_id(self, tree: ttk.Treeview, label: str) -> int | None:
+        selection = tree.selection()
+        if not selection:
+            messagebox.showinfo(
+                "Seçim gerekli", f"Lütfen {label} tablosundan kayıt seçin.", parent=self.root
+            )
+            return None
+        return int(tree.item(selection[0], "values")[0])
+
+    def _form(
+        self,
+        title: str,
+        fields: list[tuple[str, str]],
+        submit: Callable[[dict[str, str]], bool],
+        initial: dict[str, str] | None = None,
+    ) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        entries: dict[str, ttk.Entry] = {}
+        for index, (key, label) in enumerate(fields):
+            ttk.Label(dialog, text=label).grid(
+                row=index, column=0, sticky="w", padx=10, pady=6
+            )
+            entry = ttk.Entry(dialog, width=38)
+            entry.grid(row=index, column=1, padx=10, pady=6)
+            if initial and key in initial:
+                entry.insert(0, initial[key])
+            entries[key] = entry
+
+        def save() -> None:
+            if submit({key: entry.get() for key, entry in entries.items()}):
+                dialog.destroy()
+
+        ttk.Button(dialog, text="Kaydet", command=save).grid(
+            row=len(fields), column=1, sticky="e", padx=10, pady=10
+        )
+        next(iter(entries.values())).focus_set()
+        dialog.bind("<Return>", lambda _event: save())
+
+    def _selected_book(self) -> Any | None:
+        book_id = self._selected_id(self.books_tree, "kitap")
+        if book_id is None:
+            return None
+        return self._perform(
+            lambda: next(
+                (book for book in self.library.list_books() if book["id"] == book_id),
+                None,
+            )
+        )
+
+    def _selected_member(self) -> Any | None:
+        member_id = self._selected_id(self.members_tree, "üye")
+        if member_id is None:
+            return None
+        return self._perform(
+            lambda: next(
+                (
+                    member
+                    for member in self.library.list_members()
+                    if member["id"] == member_id
+                ),
+                None,
+            )
+        )
+
+    def _add_book(self) -> None:
+        def submit(values: dict[str, str]) -> bool:
+            def add() -> int:
+                year = values["year"].strip()
+                return self.library.add_book(
+                    values["title"], values["author"], values["isbn"],
+                    int(year) if year else None,
+                )
+
+            result = self._perform(add)
+            if result is _FAILED:
+                return False
+            self.refresh_all()
+            messagebox.showinfo("Kitap eklendi", f"Kitap ID: {result}", parent=self.root)
+            return True
+
+        self._form(
+            "Kitap Ekle",
+            [
+                ("title", "Kitap adı *"),
+                ("author", "Yazar *"),
+                ("isbn", "ISBN"),
+                ("year", "Yayın yılı"),
+            ],
+            submit,
+        )
+
+    def _edit_book(self) -> None:
+        book = self._selected_book()
+        if book is None or book is _FAILED:
+            return
+        book_id = int(book["id"])
+
+        def submit(values: dict[str, str]) -> bool:
+            def update() -> None:
+                year = values["year"].strip()
+                self.library.update_book(
+                    book_id,
+                    values["title"],
+                    values["author"],
+                    values["isbn"],
+                    int(year) if year else None,
+                )
+
+            if self._perform(update) is _FAILED:
+                return False
+            self.refresh_all()
+            return True
+
+        self._form(
+            "Kitap Bilgilerini Düzenle",
+            [
+                ("title", "Kitap adı *"),
+                ("author", "Yazar *"),
+                ("isbn", "ISBN"),
+                ("year", "Yayın yılı"),
+            ],
+            submit,
+            {
+                "title": book["title"],
+                "author": book["author"],
+                "isbn": book["isbn"] or "",
+                "year": str(book["publish_year"] or ""),
+            },
+        )
+
+    def _delete_book(self) -> None:
+        book_id = self._selected_id(self.books_tree, "kitap")
+        if book_id is None or not messagebox.askyesno(
+            "Kitabı sil", "Seçili kitabı silmek istiyor musunuz?", parent=self.root
+        ):
+            return
+        if self._perform(lambda: self.library.delete_book(book_id)) is not _FAILED:
+            self.refresh_all()
+
+    def _add_member(self) -> None:
+        def submit(values: dict[str, str]) -> bool:
+            result = self._perform(
+                lambda: self.library.add_member(
+                    values["name"], values["phone"], values["email"]
+                )
+            )
+            if result is _FAILED:
+                return False
+            self.refresh_all()
+            messagebox.showinfo("Üye eklendi", f"Üye ID: {result}", parent=self.root)
+            return True
+
+        self._form(
+            "Üye Ekle",
+            [("name", "Ad soyad *"), ("phone", "Telefon"), ("email", "E-posta")],
+            submit,
+        )
+
+    def _edit_member(self) -> None:
+        member = self._selected_member()
+        if member is None or member is _FAILED:
+            return
+        member_id = int(member["id"])
+
+        def submit(values: dict[str, str]) -> bool:
+            result = self._perform(
+                lambda: self.library.update_member(
+                    member_id, values["name"], values["phone"], values["email"]
+                )
+            )
+            if result is _FAILED:
+                return False
+            self.refresh_all()
+            return True
+
+        self._form(
+            "Üye Bilgilerini Düzenle",
+            [("name", "Ad soyad *"), ("phone", "Telefon"), ("email", "E-posta")],
+            submit,
+            {
+                "name": member["name"],
+                "phone": member["phone"] or "",
+                "email": member["email"] or "",
+            },
+        )
+
+    def _delete_member(self) -> None:
+        member_id = self._selected_id(self.members_tree, "üye")
+        if member_id is None or not messagebox.askyesno(
+            "Üyeyi sil", "Seçili üyeyi silmek istiyor musunuz?", parent=self.root
+        ):
+            return
+        if self._perform(lambda: self.library.delete_member(member_id)) is not _FAILED:
+            self.refresh_all()
+
+    def _search_books(self) -> None:
+        query = self.book_search.get().strip()
+        rows = self._perform(
+            lambda: self.library.search_books(query)
+            if query
+            else self.library.list_books()
+        )
+        if rows is not _FAILED:
+            self._replace_rows(
+                self.books_tree,
+                rows,
+                lambda row: (
+                    row["id"],
+                    row["title"],
+                    row["author"],
+                    row["isbn"] or "-",
+                    row["publish_year"] or "-",
+                    "Mevcut" if row["available"] else "Ödünçte",
+                ),
+            )
+
+    def _clear_book_search(self) -> None:
+        self.book_search.set("")
+        self.refresh_books()
+
+    def _search_members(self) -> None:
+        query = self.member_search.get().strip()
+        rows = self._perform(
+            lambda: self.library.search_members(query)
+            if query
+            else self.library.list_members()
+        )
+        if rows is not _FAILED:
+            self._replace_rows(
+                self.members_tree,
+                rows,
+                lambda row: (
+                    row["id"],
+                    row["name"],
+                    row["phone"] or "-",
+                    row["email"] or "-",
+                    row["registration_date"],
+                ),
+            )
+
+    def _clear_member_search(self) -> None:
+        self.member_search.set("")
+        self.refresh_members()
+
+    def _loan_book(self) -> None:
+        def submit(values: dict[str, str]) -> bool:
+            def loan() -> int:
+                days = values["days"].strip()
+                return self.library.loan_book(
+                    int(values["book_id"]),
+                    int(values["member_id"]),
+                    int(days) if days else 14,
+                )
+
+            loan_id = self._perform(loan)
+            if loan_id is _FAILED:
+                return False
+            self.refresh_all()
+            messagebox.showinfo(
+                "Ödünç verildi", f"İşlem ID: {loan_id}", parent=self.root
+            )
+            return True
+
+        self._form(
+            "Kitap Ödünç Ver",
+            [
+                ("book_id", "Kitap ID *"),
+                ("member_id", "Üye ID *"),
+                ("days", "Ödünç süresi (gün, varsayılan 14)"),
+            ],
+            submit,
+        )
+
+    def _return_book(self) -> None:
+        selection = self.loans_tree.selection()
+        if not selection:
+            messagebox.showinfo(
+                "Seçim gerekli", "İade alınacak ödünç işlemini seçin.", parent=self.root
+            )
+            return
+        values = self.loans_tree.item(selection[0], "values")
+        book_id = int(values[1])
+        if self._perform(lambda: self.library.return_book(book_id)) is not _FAILED:
+            self.refresh_all()
+            messagebox.showinfo("İade alındı", "Kitap başarıyla iade alındı.", parent=self.root)
+
+    def _show_member_loans(self) -> None:
+        member_id = self._selected_id(self.members_tree, "üye")
+        if member_id is None:
+            return
+        loans = self._perform(lambda: self.library.member_active_loans(member_id))
+        if loans is _FAILED:
+            return
+        if not loans:
+            messagebox.showinfo(
+                "Aktif ödünçler", "Bu üyenin aktif ödünç aldığı kitap yok.", parent=self.root
+            )
+            return
+        details = "\n".join(
+            f'{loan["title"]} — alış: {loan["loan_date"]}, son iade: {loan["due_date"]}'
+            for loan in loans
+        )
+        messagebox.showinfo("Üyenin aktif ödünçleri", details, parent=self.root)
+
+
+def run_gui(library: LibrarySystem) -> None:
+    LibraryApp(library).run()
+
+
+if __name__ == "__main__":
+    database_path = Path(__file__).resolve().parent / "library.db"
+    with LibrarySystem(database_path) as library:
+        run_gui(library)
