@@ -1,0 +1,955 @@
+from __future__ import annotations
+
+import csv
+import json
+import logging
+import os
+import sqlite3
+import tkinter as tk
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+
+APP_NAME = "Öğretmen Asistanı"
+STATUSES = ("Geldi", "Gelmedi", "Geç geldi", "İzinli")
+SUBMISSION_STATUSES = ("Bekleniyor", "Teslim edildi", "Geç teslim edildi", "Eksik")
+TODAY = date.today().isoformat()
+
+
+def application_directory() -> Path:
+    """Choose a persistent, per-user application-data directory."""
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    folder = base / "OgretmenAsistani"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+APP_DIR = application_directory()
+DB_PATH = APP_DIR / "ogretmen_asistani.sqlite3"
+SETTINGS_PATH = APP_DIR / "ayarlar.json"
+LOG_PATH = APP_DIR / "uygulama.log"
+logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s", encoding="utf-8")
+
+
+class Database:
+    def __init__(self, path: Path = DB_PATH):
+        self.path = path
+        self.initialize()
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    def initialize(self) -> None:
+        with self.connect() as db:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS classes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    course_name TEXT NOT NULL DEFAULT '',
+                    teacher_name TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS students (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    class_id INTEGER NOT NULL REFERENCES classes(id),
+                    student_no TEXT NOT NULL,
+                    first_name TEXT NOT NULL,
+                    last_name TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+                    UNIQUE(class_id, student_no)
+                );
+                CREATE TABLE IF NOT EXISTS attendance_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    class_id INTEGER NOT NULL REFERENCES classes(id),
+                    attendance_date TEXT NOT NULL,
+                    UNIQUE(class_id, attendance_date)
+                );
+                CREATE TABLE IF NOT EXISTS attendance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES attendance_sessions(id) ON DELETE CASCADE,
+                    student_id INTEGER NOT NULL REFERENCES students(id),
+                    status TEXT NOT NULL CHECK(status IN ('Geldi','Gelmedi','Geç geldi','İzinli')),
+                    UNIQUE(session_id, student_id)
+                );
+                CREATE TABLE IF NOT EXISTS assignments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    class_id INTEGER NOT NULL REFERENCES classes(id),
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    due_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS assignment_targets (
+                    assignment_id INTEGER NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+                    student_id INTEGER NOT NULL REFERENCES students(id),
+                    PRIMARY KEY(assignment_id, student_id)
+                );
+                CREATE TABLE IF NOT EXISTS assignment_submissions (
+                    assignment_id INTEGER NOT NULL,
+                    student_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'Bekleniyor'
+                        CHECK(status IN ('Bekleniyor','Teslim edildi','Geç teslim edildi','Eksik')),
+                    score REAL,
+                    teacher_note TEXT NOT NULL DEFAULT '',
+                    submitted_on TEXT,
+                    PRIMARY KEY(assignment_id, student_id),
+                    FOREIGN KEY(assignment_id, student_id)
+                        REFERENCES assignment_targets(assignment_id, student_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_students_name ON students(last_name, first_name);
+                CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_sessions(attendance_date);
+                CREATE INDEX IF NOT EXISTS idx_assignments_due ON assignments(due_date);
+            """)
+
+
+def load_settings() -> dict:
+    defaults = {"absence_threshold": 5}
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            defaults.update(data)
+    except (OSError, json.JSONDecodeError):
+        pass
+    return defaults
+
+
+def save_settings(settings: dict) -> None:
+    SETTINGS_PATH.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class TeacherAssistant(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.db = Database()
+        self.settings = load_settings()
+        self.title(APP_NAME)
+        self.geometry("1180x760")
+        self.minsize(960, 620)
+        self.configure(bg="#f4f6f9")
+        self.style = ttk.Style(self)
+        try:
+            self.style.theme_use("clam")
+        except tk.TclError:
+            pass
+        self._configure_style()
+        self.sidebar = tk.Frame(self, bg="#17263c", width=220)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
+        tk.Label(self.sidebar, text="ÖĞRETMEN\nASİSTANI", justify="left", anchor="w",
+                 bg="#17263c", fg="white", font=("Segoe UI", 18, "bold"),
+                 padx=22, pady=26).pack(fill="x")
+        self.nav_buttons = {}
+        for key, label in (("home", "Genel Bakış"), ("students", "Öğrenciler"),
+                           ("attendance", "Yoklama"), ("assignments", "Ödevler"),
+                           ("reports", "Raporlar")):
+            button = tk.Button(self.sidebar, text=label, command=lambda k=key: self.show_page(k),
+                               anchor="w", padx=24, pady=13, relief="flat", borderwidth=0,
+                               bg="#17263c", fg="#d7e0eb", activebackground="#263b58",
+                               activeforeground="white", font=("Segoe UI", 11))
+            button.pack(fill="x", padx=10, pady=2)
+            self.nav_buttons[key] = button
+        tk.Label(self.sidebar, text="Çevrimdışı · Yerel SQLite", bg="#17263c", fg="#8fa2bb",
+                 font=("Segoe UI", 9), anchor="w", padx=22).pack(side="bottom", fill="x", pady=18)
+        self.main = tk.Frame(self, bg="#f4f6f9")
+        self.main.pack(side="left", fill="both", expand=True)
+        self.show_page("home")
+
+    def _configure_style(self):
+        self.style.configure("TFrame", background="#f4f6f9")
+        self.style.configure("TLabel", background="#f4f6f9", foreground="#203047", font=("Segoe UI", 10))
+        self.style.configure("Title.TLabel", font=("Segoe UI", 22, "bold"), foreground="#17263c")
+        self.style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground="#69798d")
+        self.style.configure("TButton", font=("Segoe UI", 10), padding=(10, 7))
+        self.style.configure("Primary.TButton", background="#2864d7", foreground="white")
+        self.style.map("Primary.TButton", background=[("active", "#1e52b8")])
+        self.style.configure("Treeview", rowheight=30, font=("Segoe UI", 10), background="white",
+                             fieldbackground="white")
+        self.style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"), padding=8)
+        self.style.configure("TCombobox", padding=5)
+
+    def clear_main(self):
+        for child in self.main.winfo_children():
+            child.destroy()
+
+    def page_header(self, title: str, subtitle: str = ""):
+        wrap = ttk.Frame(self.main, padding=(28, 24, 28, 10))
+        wrap.pack(fill="x")
+        ttk.Label(wrap, text=title, style="Title.TLabel").pack(anchor="w")
+        if subtitle:
+            ttk.Label(wrap, text=subtitle, style="Subtitle.TLabel").pack(anchor="w", pady=(5, 0))
+        return wrap
+
+    def body(self):
+        body = ttk.Frame(self.main, padding=(28, 10, 28, 24))
+        body.pack(fill="both", expand=True)
+        return body
+
+    def show_page(self, page: str):
+        self.clear_main()
+        for key, button in self.nav_buttons.items():
+            button.configure(bg="#263b58" if key == page else "#17263c",
+                             fg="white" if key == page else "#d7e0eb")
+        pages = {"home": self.show_home, "students": self.show_students,
+                 "attendance": self.show_attendance, "assignments": self.show_assignments,
+                 "reports": self.show_reports}
+        pages[page]()
+
+    def query(self, sql: str, params=()):
+        with self.db.connect() as db:
+            return db.execute(sql, params).fetchall()
+
+    def classes(self):
+        return self.query("SELECT * FROM classes ORDER BY name")
+
+    def class_options(self, include_all=False):
+        options = [(int(row["id"]), row["name"]) for row in self.classes()]
+        if include_all:
+            options.insert(0, (0, "Tüm sınıflar"))
+        return options
+
+    def show_home(self):
+        header = self.page_header("Genel Bakış", "Sınıflarınızın ve bugünkü işlerin kısa özeti")
+        threshold = int(self.settings.get("absence_threshold", 5))
+        ttk.Button(header, text=f"Devamsızlık eşiği: {threshold} gün", command=self.edit_threshold).pack(anchor="e", pady=(8, 0))
+        body = self.body()
+        with self.db.connect() as db:
+            active_students = db.execute("SELECT COUNT(*) FROM students WHERE active=1").fetchone()[0]
+            today_sessions = db.execute("SELECT COUNT(*) FROM attendance_sessions WHERE attendance_date=?", (TODAY,)).fetchone()[0]
+            class_count = db.execute("SELECT COUNT(*) FROM classes").fetchone()[0]
+            pending = db.execute("""SELECT COUNT(*) FROM assignment_submissions s
+                JOIN assignments a ON a.id=s.assignment_id
+                WHERE s.status IN ('Bekleniyor','Eksik') AND a.due_date < ?""", (TODAY,)).fetchone()[0]
+            frequent = db.execute("""SELECT st.student_no, st.first_name, st.last_name, c.name,
+                COUNT(*) AS absences FROM attendance at
+                JOIN attendance_sessions se ON se.id=at.session_id
+                JOIN students st ON st.id=at.student_id JOIN classes c ON c.id=st.class_id
+                WHERE st.active=1 AND at.status='Gelmedi'
+                GROUP BY st.id HAVING COUNT(*) >= ? ORDER BY absences DESC""", (threshold,)).fetchall()
+            upcoming = db.execute("""SELECT a.title, a.due_date, c.name AS class_name,
+                SUM(CASE WHEN s.status IN ('Bekleniyor','Eksik') THEN 1 ELSE 0 END) AS remaining
+                FROM assignments a JOIN classes c ON c.id=a.class_id
+                JOIN assignment_submissions s ON s.assignment_id=a.id
+                WHERE a.due_date BETWEEN ? AND ?
+                GROUP BY a.id ORDER BY a.due_date LIMIT 8""",
+                (TODAY, (date.today() + timedelta(days=7)).isoformat())).fetchall()
+        cards = ttk.Frame(body)
+        cards.pack(fill="x")
+        values = (("Aktif öğrenci", active_students), ("Sınıf", class_count),
+                  ("Bugün yoklama alınan sınıf", f"{today_sessions}/{class_count}"),
+                  ("Süresi geçmiş, tamamlanmamış", pending))
+        for i, (label, value) in enumerate(values):
+            card = tk.Frame(cards, bg="white", padx=18, pady=16, highlightbackground="#e3e8ef", highlightthickness=1)
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 10, 0), pady=4)
+            cards.grid_columnconfigure(i, weight=1)
+            tk.Label(card, text=str(value), bg="white", fg="#2864d7", font=("Segoe UI", 22, "bold")).pack(anchor="w")
+            tk.Label(card, text=label, bg="white", fg="#69798d", font=("Segoe UI", 9)).pack(anchor="w", pady=(5, 0))
+        columns = ttk.Frame(body)
+        columns.pack(fill="both", expand=True, pady=(22, 0))
+        left = ttk.LabelFrame(columns, text="Yaklaşan ödevler · 7 gün", padding=12)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        right = ttk.LabelFrame(columns, text=f"Devamsızlık eşiği · {threshold}+ gün", padding=12)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        upcoming_tree = self.make_tree(left, ("title", "class", "due", "remaining"),
+                                       ("Ödev", "Sınıf", "Son tarih", "Bekleyen"), (220, 100, 100, 80))
+        for row in upcoming:
+            upcoming_tree.insert("", "end", values=(row["title"], row["class_name"], row["due_date"], row["remaining"]))
+        frequent_tree = self.make_tree(right, ("no", "name", "class", "count"),
+                                       ("No", "Öğrenci", "Sınıf", "Gün"), (60, 160, 90, 55))
+        for row in frequent:
+            frequent_tree.insert("", "end", values=(row["student_no"], f'{row["first_name"]} {row["last_name"]}', row["name"], row["absences"]))
+        if not upcoming:
+            ttk.Label(left, text="Önümüzdeki 7 günde teslim tarihi olan ödev yok.").pack(anchor="w", pady=10)
+        if not frequent:
+            ttk.Label(right, text="Eşiği aşan öğrenci yok.").pack(anchor="w", pady=10)
+
+    def edit_threshold(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Devamsızlık eşiği")
+        dialog.transient(self)
+        dialog.grab_set()
+        form = ttk.Frame(dialog, padding=18)
+        form.pack(fill="both", expand=True)
+        ttk.Label(form, text="Uyarı eşiği (Gelmedi sayısı)").pack(anchor="w")
+        entry = ttk.Entry(form, width=10)
+        entry.insert(0, str(self.settings.get("absence_threshold", 5)))
+        entry.pack(anchor="w", pady=10)
+        def save():
+            try:
+                value = int(entry.get())
+                if value < 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Değer hatalı", "Eşik 1 veya daha büyük bir tam sayı olmalıdır.", parent=dialog)
+                return
+            self.settings["absence_threshold"] = value
+            try:
+                save_settings(self.settings)
+            except OSError as exc:
+                messagebox.showerror("Ayar kaydedilemedi", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+            self.show_page("home")
+        ttk.Button(form, text="Kaydet", style="Primary.TButton", command=save).pack(anchor="e")
+
+    def make_tree(self, parent, columns, headings, widths, height=14):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(frame, columns=columns, show="headings", height=height)
+        for col, heading, width in zip(columns, headings, widths):
+            tree.heading(col, text=heading)
+            tree.column(col, width=width, minwidth=45, anchor="w", stretch=True)
+        ybar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=ybar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        ybar.pack(side="right", fill="y")
+        return tree
+
+    def show_students(self):
+        self.page_header("Öğrenciler", "Sınıfları ve öğrenci kayıtlarını yönetin")
+        body = self.body()
+        controls = ttk.Frame(body)
+        controls.pack(fill="x", pady=(0, 12))
+        ttk.Label(controls, text="Sınıf:").pack(side="left")
+        options = self.class_options(include_all=True)
+        self.student_class_map = {name: ident for ident, name in options}
+        self.student_class = ttk.Combobox(controls, state="readonly", width=24, values=list(self.student_class_map))
+        self.student_class.pack(side="left", padx=(7, 18))
+        self.student_class.set(options[0][1] if options else "")
+        ttk.Label(controls, text="Ara:").pack(side="left")
+        self.student_search = ttk.Entry(controls, width=28)
+        self.student_search.pack(side="left", padx=7)
+        self.student_search.bind("<KeyRelease>", lambda _e: self.refresh_students())
+        self.student_class.bind("<<ComboboxSelected>>", lambda _e: self.refresh_students())
+        ttk.Button(controls, text="Sınıfları yönet", command=self.manage_classes).pack(side="right", padx=(8, 0))
+        ttk.Button(controls, text="Öğrenci ekle", style="Primary.TButton", command=self.add_student).pack(side="right")
+        area = ttk.Frame(body)
+        area.pack(fill="both", expand=True)
+        self.students_tree = self.make_tree(area, ("no", "first", "last", "class", "state"),
+                                            ("Öğrenci no", "Ad", "Soyad", "Sınıf", "Durum"),
+                                            (120, 180, 180, 160, 100), height=18)
+        self.students_tree.bind("<Double-1>", lambda _e: self.edit_student())
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(12, 0))
+        ttk.Button(actions, text="Seçileni düzenle", command=self.edit_student).pack(side="left")
+        ttk.Button(actions, text="Aktif / pasif değiştir", command=self.toggle_student).pack(side="left", padx=8)
+        self.refresh_students()
+
+    def refresh_students(self):
+        if not hasattr(self, "students_tree") or not self.students_tree.winfo_exists():
+            return
+        for item in self.students_tree.get_children():
+            self.students_tree.delete(item)
+        class_id = self.student_class_map.get(self.student_class.get(), 0)
+        search = self.student_search.get().strip()
+        sql = """SELECT s.*, c.name AS class_name FROM students s JOIN classes c ON c.id=s.class_id
+                 WHERE (?=0 OR s.class_id=?) AND (?='' OR s.student_no LIKE ? OR s.first_name LIKE ? OR s.last_name LIKE ?)
+                 ORDER BY c.name, s.last_name, s.first_name"""
+        rows = self.query(sql, (class_id, class_id, search, f"%{search}%", f"%{search}%", f"%{search}%"))
+        for row in rows:
+            self.students_tree.insert("", "end", iid=str(row["id"]), values=(row["student_no"], row["first_name"],
+                row["last_name"], row["class_name"], "Aktif" if row["active"] else "Pasif"))
+
+    def manage_classes(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Sınıfları yönet")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("520x420")
+        ttk.Label(dialog, text="Sınıf listesi", font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=18, pady=(18, 10))
+        tree = self.make_tree(dialog, ("name", "course", "teacher"), ("Sınıf", "Ders", "Öğretmen"), (150, 150, 160), height=8)
+        def refresh():
+            for item in tree.get_children():
+                tree.delete(item)
+            for row in self.classes():
+                tree.insert("", "end", iid=str(row["id"]), values=(row["name"], row["course_name"], row["teacher_name"]))
+        def add_class():
+            form = tk.Toplevel(dialog)
+            form.title("Yeni sınıf")
+            form.transient(dialog)
+            form.grab_set()
+            fields = {}
+            for label in ("Sınıf adı", "Ders adı", "Öğretmen adı"):
+                line = ttk.Frame(form, padding=(16, 7))
+                line.pack(fill="x")
+                ttk.Label(line, text=label, width=15).pack(side="left")
+                entry = ttk.Entry(line, width=30)
+                entry.pack(side="left", fill="x", expand=True)
+                fields[label] = entry
+            def save():
+                name = fields["Sınıf adı"].get().strip()
+                if not name:
+                    messagebox.showerror("Eksik bilgi", "Sınıf adı zorunludur.", parent=form)
+                    return
+                try:
+                    with self.db.connect() as db:
+                        db.execute("INSERT INTO classes(name, course_name, teacher_name) VALUES (?, ?, ?)",
+                                   (name, fields["Ders adı"].get().strip(), fields["Öğretmen adı"].get().strip()))
+                    refresh()
+                    if hasattr(self, "student_class") and self.student_class.winfo_exists():
+                        options = self.class_options(include_all=True)
+                        self.student_class_map = {name: ident for ident, name in options}
+                        self.student_class.configure(values=list(self.student_class_map))
+                        if options:
+                            self.student_class.set(options[0][1])
+                    if hasattr(self, "assignment_filter") and self.assignment_filter.winfo_exists():
+                        options = self.class_options(include_all=True)
+                        self.assignment_filter_map = {name: ident for ident, name in options}
+                        self.assignment_filter.configure(values=list(self.assignment_filter_map))
+                        if options:
+                            self.assignment_filter.set(options[0][1])
+                    self.refresh_students()
+                    self.refresh_assignments()
+                    form.destroy()
+                except sqlite3.IntegrityError:
+                    messagebox.showerror("Kayıt mevcut", "Bu sınıf adı zaten kullanılıyor.", parent=form)
+            ttk.Button(form, text="Kaydet", style="Primary.TButton", command=save).pack(anchor="e", padx=16, pady=14)
+            fields["Sınıf adı"].focus_set()
+        ttk.Button(dialog, text="Sınıf ekle", style="Primary.TButton", command=add_class).pack(anchor="e", padx=18, pady=14)
+        refresh()
+
+    def student_dialog(self, student_id=None):
+        options = self.class_options()
+        if not options:
+            messagebox.showinfo("Önce sınıf ekleyin", "Öğrenci eklemeden önce bir sınıf oluşturun.")
+            self.manage_classes()
+            return
+        existing = self.query("SELECT * FROM students WHERE id=?", (student_id,))[0] if student_id else None
+        dialog = tk.Toplevel(self)
+        dialog.title("Öğrenciyi düzenle" if existing else "Öğrenci ekle")
+        dialog.transient(self)
+        dialog.grab_set()
+        fields = {}
+        rows = (("Sınıf", "class"), ("Öğrenci numarası", "no"), ("Ad", "first"), ("Soyad", "last"))
+        for label, key in rows:
+            line = ttk.Frame(dialog, padding=(18, 8))
+            line.pack(fill="x")
+            ttk.Label(line, text=label, width=18).pack(side="left")
+            if key == "class":
+                names = [name for _id, name in options]
+                field = ttk.Combobox(line, state="readonly", values=names, width=27)
+            else:
+                field = ttk.Entry(line, width=30)
+            field.pack(side="left", fill="x", expand=True)
+            fields[key] = field
+        class_map = {name: ident for ident, name in options}
+        if existing:
+            fields["class"].set(next(name for ident, name in options if ident == existing["class_id"]))
+            for key, col in (("no", "student_no"), ("first", "first_name"), ("last", "last_name")):
+                fields[key].insert(0, existing[col])
+        elif names:
+            fields["class"].set(names[0])
+        def save():
+            class_id = class_map.get(fields["class"].get())
+            number, first, last = (fields[k].get().strip() for k in ("no", "first", "last"))
+            if not class_id or not number or not first or not last:
+                messagebox.showerror("Eksik bilgi", "Sınıf, öğrenci numarası, ad ve soyad zorunludur.", parent=dialog)
+                return
+            try:
+                with self.db.connect() as db:
+                    if existing:
+                        db.execute("UPDATE students SET class_id=?, student_no=?, first_name=?, last_name=? WHERE id=?",
+                                   (class_id, number, first, last, student_id))
+                    else:
+                        db.execute("INSERT INTO students(class_id, student_no, first_name, last_name) VALUES (?, ?, ?, ?)",
+                                   (class_id, number, first, last))
+                dialog.destroy()
+                self.refresh_students()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Numara kullanılıyor", "Bu sınıfta aynı öğrenci numarası zaten kayıtlı.", parent=dialog)
+        ttk.Button(dialog, text="Kaydet", style="Primary.TButton", command=save).pack(anchor="e", padx=18, pady=14)
+
+    def add_student(self):
+        self.student_dialog()
+
+    def selected_student_id(self):
+        selection = self.students_tree.selection()
+        return int(selection[0]) if selection else None
+
+    def edit_student(self):
+        student_id = self.selected_student_id()
+        if student_id is None:
+            messagebox.showinfo("Öğrenci seçin", "Düzenlemek için listeden bir öğrenci seçin.")
+            return
+        self.student_dialog(student_id)
+
+    def toggle_student(self):
+        student_id = self.selected_student_id()
+        if student_id is None:
+            messagebox.showinfo("Öğrenci seçin", "Durumunu değiştirmek için listeden bir öğrenci seçin.")
+            return
+        with self.db.connect() as db:
+            db.execute("UPDATE students SET active=1-active WHERE id=?", (student_id,))
+        self.refresh_students()
+
+    def show_attendance(self):
+        self.page_header("Yoklama", "Sadece kaydedilmiş yoklama günleri devamsızlığa dahil edilir")
+        body = self.body()
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(0, 12))
+        options = self.class_options()
+        self.att_class_map = {name: ident for ident, name in options}
+        ttk.Label(bar, text="Sınıf:").pack(side="left")
+        self.att_class = ttk.Combobox(bar, state="readonly", values=list(self.att_class_map), width=22)
+        self.att_class.pack(side="left", padx=7)
+        if options:
+            self.att_class.set(options[0][1])
+        ttk.Label(bar, text="Tarih (YYYY-MM-DD):").pack(side="left", padx=(14, 0))
+        self.att_date = ttk.Entry(bar, width=14)
+        self.att_date.insert(0, TODAY)
+        self.att_date.pack(side="left", padx=7)
+        ttk.Button(bar, text="Yükle", command=self.load_attendance).pack(side="left", padx=4)
+        ttk.Button(bar, text="Tümünü geldi işaretle", command=self.mark_all_present).pack(side="right")
+        self.att_tree = self.make_tree(body, ("no", "name", "status"), ("Öğrenci no", "Öğrenci", "Durum"), (140, 300, 170), height=17)
+        edit = ttk.Frame(body)
+        edit.pack(fill="x", pady=(12, 0))
+        ttk.Label(edit, text="Seçilen öğrenci için durum:").pack(side="left")
+        self.att_status = ttk.Combobox(edit, state="readonly", values=STATUSES, width=18)
+        self.att_status.set("Geldi")
+        self.att_status.pack(side="left", padx=8)
+        ttk.Button(edit, text="Durumu uygula", command=self.set_attendance_status).pack(side="left")
+        ttk.Button(edit, text="Yoklamayı kaydet", style="Primary.TButton", command=self.save_attendance).pack(side="right")
+        self.load_attendance()
+
+    def valid_date(self, value: str) -> str:
+        return date.fromisoformat(value.strip()).isoformat()
+
+    def load_attendance(self):
+        if not hasattr(self, "att_tree") or not self.att_tree.winfo_exists():
+            return
+        for item in self.att_tree.get_children():
+            self.att_tree.delete(item)
+        class_id = self.att_class_map.get(self.att_class.get())
+        if not class_id:
+            return
+        try:
+            attendance_date = self.valid_date(self.att_date.get())
+        except ValueError:
+            messagebox.showerror("Tarih biçimi hatalı", "Tarihi YYYY-MM-DD biçiminde girin.")
+            return
+        rows = self.query("""SELECT s.id, s.student_no, s.first_name, s.last_name, a.status
+            FROM students s LEFT JOIN attendance_sessions se ON se.class_id=? AND se.attendance_date=?
+            LEFT JOIN attendance a ON a.session_id=se.id AND a.student_id=s.id
+            WHERE s.class_id=? AND s.active=1 ORDER BY s.last_name, s.first_name""",
+            (class_id, attendance_date, class_id))
+        for row in rows:
+            self.att_tree.insert("", "end", iid=str(row["id"]), values=(row["student_no"],
+                f'{row["first_name"]} {row["last_name"]}', row["status"] or "Bekliyor"))
+
+    def set_attendance_status(self):
+        selection = self.att_tree.selection()
+        if not selection:
+            messagebox.showinfo("Öğrenci seçin", "Durum uygulamak için bir öğrenci seçin.")
+            return
+        for item in selection:
+            values = list(self.att_tree.item(item, "values"))
+            values[2] = self.att_status.get()
+            self.att_tree.item(item, values=values)
+
+    def mark_all_present(self):
+        for item in self.att_tree.get_children():
+            values = list(self.att_tree.item(item, "values"))
+            values[2] = "Geldi"
+            self.att_tree.item(item, values=values)
+
+    def save_attendance(self):
+        class_id = self.att_class_map.get(self.att_class.get())
+        if not class_id:
+            messagebox.showinfo("Sınıf gerekli", "Önce sınıf oluşturun ve seçin.")
+            return
+        try:
+            attendance_date = self.valid_date(self.att_date.get())
+        except ValueError:
+            messagebox.showerror("Tarih biçimi hatalı", "Tarihi YYYY-MM-DD biçiminde girin.")
+            return
+        try:
+            with self.db.connect() as db:
+                db.execute("INSERT OR IGNORE INTO attendance_sessions(class_id, attendance_date) VALUES (?, ?)",
+                           (class_id, attendance_date))
+                session_id = db.execute("SELECT id FROM attendance_sessions WHERE class_id=? AND attendance_date=?",
+                                        (class_id, attendance_date)).fetchone()[0]
+                for item in self.att_tree.get_children():
+                    student_id = int(item)
+                    status = self.att_tree.item(item, "values")[2]
+                    if status == "Bekliyor":
+                        db.execute("DELETE FROM attendance WHERE session_id=? AND student_id=?", (session_id, student_id))
+                        continue
+                    db.execute("""INSERT INTO attendance(session_id, student_id, status) VALUES (?, ?, ?)
+                        ON CONFLICT(session_id, student_id) DO UPDATE SET status=excluded.status""",
+                        (session_id, student_id, status))
+            self.load_attendance()
+            messagebox.showinfo("Kaydedildi", "Yoklama kaydedildi. Bu sınıf ve tarih için ikinci kayıt açılmaz.")
+        except sqlite3.Error:
+            logging.exception("Yoklama kaydedilemedi")
+            messagebox.showerror("Kayıt hatası", "Yoklama kaydedilemedi. Uygulama günlüğünü kontrol edin.")
+
+    def show_assignments(self):
+        self.page_header("Ödevler", "Sınıfa ya da seçtiğiniz öğrencilere ödev atayın ve teslimleri izleyin")
+        body = self.body()
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(0, 12))
+        ttk.Label(bar, text="Sınıf filtresi:").pack(side="left")
+        options = self.class_options(include_all=True)
+        self.assignment_filter_map = {name: ident for ident, name in options}
+        self.assignment_filter = ttk.Combobox(bar, state="readonly", values=list(self.assignment_filter_map), width=22)
+        self.assignment_filter.pack(side="left", padx=7)
+        if options:
+            self.assignment_filter.set(options[0][1])
+        self.assignment_filter.bind("<<ComboboxSelected>>", lambda _e: self.refresh_assignments())
+        self.overdue_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Sadece süresi geçen ve bekleyenler", variable=self.overdue_only,
+                        command=self.refresh_assignments).pack(side="left", padx=10)
+        ttk.Button(bar, text="Ödev oluştur", style="Primary.TButton", command=self.add_assignment).pack(side="right")
+        self.assignment_tree = self.make_tree(body, ("title", "class", "due", "assigned", "done", "remaining"),
+            ("Ödev", "Sınıf", "Son tarih", "Atanan", "Teslim", "Bekleyen / eksik"), (240, 130, 110, 85, 80, 135), height=17)
+        self.assignment_tree.bind("<Double-1>", lambda _e: self.manage_submission())
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(12, 0))
+        ttk.Button(actions, text="Teslim durumlarını yönet", command=self.manage_submission).pack(side="left")
+        self.refresh_assignments()
+
+    def refresh_assignments(self):
+        if not hasattr(self, "assignment_tree") or not self.assignment_tree.winfo_exists():
+            return
+        for item in self.assignment_tree.get_children():
+            self.assignment_tree.delete(item)
+        class_id = self.assignment_filter_map.get(self.assignment_filter.get(), 0)
+        rows = self.query("""SELECT a.id, a.title, a.due_date, c.name AS class_name,
+            COUNT(t.student_id) AS assigned,
+            SUM(CASE WHEN s.status IN ('Teslim edildi','Geç teslim edildi') THEN 1 ELSE 0 END) AS done,
+            SUM(CASE WHEN s.status IN ('Bekleniyor','Eksik') THEN 1 ELSE 0 END) AS remaining
+            FROM assignments a JOIN classes c ON c.id=a.class_id
+            LEFT JOIN assignment_targets t ON t.assignment_id=a.id
+            LEFT JOIN assignment_submissions s ON s.assignment_id=t.assignment_id AND s.student_id=t.student_id
+            WHERE (?=0 OR a.class_id=?) AND (?=0 OR a.due_date < ?)
+            GROUP BY a.id HAVING (?=0 OR SUM(CASE WHEN s.status IN ('Bekleniyor','Eksik') THEN 1 ELSE 0 END) > 0)
+            ORDER BY a.due_date DESC, a.id DESC""",
+            (class_id, class_id, int(self.overdue_only.get()), TODAY, int(self.overdue_only.get())))
+        for row in rows:
+            self.assignment_tree.insert("", "end", iid=str(row["id"]), values=(row["title"], row["class_name"],
+                row["due_date"], row["assigned"], row["done"] or 0, row["remaining"] or 0))
+
+    def add_assignment(self):
+        options = self.class_options()
+        if not options:
+            messagebox.showinfo("Önce sınıf ekleyin", "Ödev atamadan önce bir sınıf oluşturun.")
+            self.manage_classes()
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Ödev oluştur")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("560x650")
+        form = ttk.Frame(dialog, padding=18)
+        form.pack(fill="both", expand=True)
+        names = [name for _id, name in options]
+        class_map = {name: ident for ident, name in options}
+        ttk.Label(form, text="Sınıf").grid(row=0, column=0, sticky="w", pady=5)
+        class_combo = ttk.Combobox(form, state="readonly", values=names, width=35)
+        class_combo.grid(row=0, column=1, sticky="ew", pady=5)
+        class_combo.set(names[0])
+        ttk.Label(form, text="Başlık").grid(row=1, column=0, sticky="w", pady=5)
+        title_entry = ttk.Entry(form, width=38)
+        title_entry.grid(row=1, column=1, sticky="ew", pady=5)
+        ttk.Label(form, text="Son tarih (YYYY-MM-DD)").grid(row=2, column=0, sticky="w", pady=5)
+        due_entry = ttk.Entry(form, width=38)
+        due_entry.insert(0, (date.today() + timedelta(days=7)).isoformat())
+        due_entry.grid(row=2, column=1, sticky="ew", pady=5)
+        ttk.Label(form, text="Açıklama").grid(row=3, column=0, sticky="nw", pady=5)
+        description = tk.Text(form, width=38, height=4, font=("Segoe UI", 10), wrap="word")
+        description.grid(row=3, column=1, sticky="ew", pady=5)
+        all_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(form, text="Sınıftaki tüm aktif öğrencilere ata", variable=all_var).grid(
+            row=4, column=1, sticky="w", pady=(10, 4))
+        ttk.Label(form, text="Öğrenci seçimi").grid(row=5, column=0, sticky="nw", pady=5)
+        student_list = tk.Listbox(form, selectmode="multiple", height=11, exportselection=False,
+                                  font=("Segoe UI", 10), activestyle="none")
+        student_list.grid(row=5, column=1, sticky="nsew", pady=5)
+        def fill_students(_event=None):
+            student_list.delete(0, "end")
+            class_id = class_map.get(class_combo.get())
+            for row in self.query("SELECT id, student_no, first_name, last_name FROM students WHERE class_id=? AND active=1 ORDER BY last_name, first_name", (class_id,)):
+                student_list.insert("end", f'{row["student_no"]} · {row["first_name"]} {row["last_name"]}')
+            student_list.student_ids = [r["id"] for r in self.query(
+                "SELECT id FROM students WHERE class_id=? AND active=1 ORDER BY last_name, first_name", (class_id,))]
+        class_combo.bind("<<ComboboxSelected>>", fill_students)
+        all_var.trace_add("write", lambda *_: student_list.configure(state="disabled" if all_var.get() else "normal"))
+        form.columnconfigure(1, weight=1)
+        form.rowconfigure(5, weight=1)
+        fill_students()
+        def save():
+            title = title_entry.get().strip()
+            try:
+                due = self.valid_date(due_entry.get())
+            except ValueError:
+                messagebox.showerror("Tarih biçimi hatalı", "Son tarihi YYYY-MM-DD biçiminde girin.", parent=dialog)
+                return
+            if not title:
+                messagebox.showerror("Başlık gerekli", "Ödev başlığı boş bırakılamaz.", parent=dialog)
+                return
+            ids = student_list.student_ids if all_var.get() else [student_list.student_ids[i] for i in student_list.curselection()]
+            if not ids:
+                messagebox.showerror("Öğrenci seçin", "Ödev için en az bir aktif öğrenci seçin.", parent=dialog)
+                return
+            try:
+                with self.db.connect() as db:
+                    cursor = db.execute("INSERT INTO assignments(class_id, title, description, due_date) VALUES (?, ?, ?, ?)",
+                        (class_map[class_combo.get()], title, description.get("1.0", "end").strip(), due))
+                    assignment_id = cursor.lastrowid
+                    db.executemany("INSERT INTO assignment_targets(assignment_id, student_id) VALUES (?, ?)",
+                                   [(assignment_id, student_id) for student_id in ids])
+                    db.executemany("INSERT INTO assignment_submissions(assignment_id, student_id) VALUES (?, ?)",
+                                   [(assignment_id, student_id) for student_id in ids])
+                dialog.destroy()
+                self.refresh_assignments()
+            except sqlite3.Error:
+                logging.exception("Ödev oluşturulamadı")
+                messagebox.showerror("Kayıt hatası", "Ödev kaydedilemedi.", parent=dialog)
+        ttk.Button(form, text="Ödevi kaydet", style="Primary.TButton", command=save).grid(row=6, column=1, sticky="e", pady=(12, 0))
+        title_entry.focus_set()
+
+    def manage_submission(self):
+        selection = self.assignment_tree.selection()
+        if not selection:
+            messagebox.showinfo("Ödev seçin", "Durumları yönetmek için listeden bir ödev seçin.")
+            return
+        assignment_id = int(selection[0])
+        assignment = self.query("SELECT a.*, c.name AS class_name FROM assignments a JOIN classes c ON c.id=a.class_id WHERE a.id=?", (assignment_id,))[0]
+        dialog = tk.Toplevel(self)
+        dialog.title(f'Teslimler · {assignment["title"]}')
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("800x590")
+        ttk.Label(dialog, text=f'{assignment["title"]} · {assignment["class_name"]} · Son tarih: {assignment["due_date"]}',
+                  font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=18, pady=16)
+        tree = self.make_tree(dialog, ("no", "name", "status", "score", "note"),
+                              ("Öğrenci no", "Öğrenci", "Durum", "Puan", "Öğretmen notu"),
+                              (100, 190, 145, 70, 230), height=10)
+        rows = self.query("""SELECT st.id, st.student_no, st.first_name, st.last_name,
+            t.assignment_id AS assigned, s.status, s.score, s.teacher_note FROM students st
+            LEFT JOIN assignment_targets t ON t.student_id=st.id AND t.assignment_id=?
+            LEFT JOIN assignment_submissions s ON s.assignment_id=t.assignment_id AND s.student_id=st.id
+            WHERE st.class_id=? AND (st.active=1 OR t.assignment_id IS NOT NULL)
+            ORDER BY st.last_name, st.first_name""", (assignment_id, assignment["class_id"]))
+        for row in rows:
+            status = row["status"] or "Verilmedi / atanmadı"
+            tag = () if row["assigned"] is not None else ("unassigned",)
+            tree.insert("", "end", iid=str(row["id"]), values=(row["student_no"], f'{row["first_name"]} {row["last_name"]}',
+                status, "" if row["score"] is None else row["score"], row["teacher_note"]), tags=tag)
+        tree.tag_configure("unassigned", foreground="#8996a7")
+        editor = ttk.LabelFrame(dialog, text="Seçili öğrencinin kaydı", padding=12)
+        editor.pack(fill="x", padx=18, pady=12)
+        ttk.Label(editor, text="Durum").grid(row=0, column=0, sticky="w", padx=5)
+        status_combo = ttk.Combobox(editor, state="readonly", values=SUBMISSION_STATUSES, width=20)
+        status_combo.grid(row=1, column=0, padx=5, sticky="w")
+        ttk.Label(editor, text="Puan (isteğe bağlı)").grid(row=0, column=1, sticky="w", padx=5)
+        score_entry = ttk.Entry(editor, width=16)
+        score_entry.grid(row=1, column=1, padx=5, sticky="w")
+        ttk.Label(editor, text="Öğretmen notu").grid(row=0, column=2, sticky="w", padx=5)
+        note_entry = ttk.Entry(editor, width=38)
+        note_entry.grid(row=1, column=2, padx=5, sticky="ew")
+        editor.columnconfigure(2, weight=1)
+        save_button = None
+        def populate(_event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            values = tree.item(sel[0], "values")
+            assigned = "unassigned" not in tree.item(sel[0], "tags")
+            status_combo.configure(state="readonly")
+            score_entry.configure(state="normal")
+            note_entry.configure(state="normal")
+            status_combo.set(values[2] if assigned else "Verilmedi / atanmadı")
+            score_entry.delete(0, "end")
+            if assigned:
+                score_entry.insert(0, values[3])
+            note_entry.delete(0, "end")
+            if assigned:
+                note_entry.insert(0, values[4])
+            if not assigned:
+                status_combo.configure(state="disabled")
+                score_entry.configure(state="disabled")
+                note_entry.configure(state="disabled")
+            if save_button:
+                save_button.configure(state="normal" if assigned else "disabled")
+        tree.bind("<<TreeviewSelect>>", populate)
+        def save_submission():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Öğrenci seçin", "Önce bir öğrenci seçin.", parent=dialog)
+                return
+            if "unassigned" in tree.item(sel[0], "tags"):
+                return
+            raw_score = score_entry.get().strip()
+            try:
+                score = None if not raw_score else float(raw_score.replace(",", "."))
+                if score is not None and not 0 <= score <= 100:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Puan hatalı", "Puanı 0-100 arasında girin.", parent=dialog)
+                return
+            student_id = int(sel[0])
+            status = status_combo.get()
+            submitted_on = date.today().isoformat() if status in ("Teslim edildi", "Geç teslim edildi") else None
+            with self.db.connect() as db:
+                db.execute("""UPDATE assignment_submissions SET status=?, score=?, teacher_note=?, submitted_on=?
+                    WHERE assignment_id=? AND student_id=?""",
+                    (status, score, note_entry.get().strip(), submitted_on, assignment_id, student_id))
+            current = list(tree.item(str(student_id), "values"))
+            current[2:] = [status, "" if score is None else score, note_entry.get().strip()]
+            tree.item(str(student_id), values=current)
+            self.refresh_assignments()
+        save_button = ttk.Button(editor, text="Durumu kaydet", style="Primary.TButton", command=save_submission)
+        save_button.grid(row=1, column=3, padx=5)
+        if rows:
+            tree.selection_set(str(rows[0]["id"]))
+            populate()
+
+    def show_reports(self):
+        self.page_header("Raporlar", "Tarih aralığına göre özet alın ve Excel'de açılabilen CSV dosyası oluşturun")
+        body = self.body()
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(0, 12))
+        options = self.class_options(include_all=True)
+        self.report_class_map = {name: ident for ident, name in options}
+        ttk.Label(bar, text="Sınıf:").pack(side="left")
+        self.report_class = ttk.Combobox(bar, state="readonly", values=list(self.report_class_map), width=18)
+        self.report_class.pack(side="left", padx=6)
+        if options:
+            self.report_class.set(options[0][1])
+        ttk.Label(bar, text="Rapor:").pack(side="left", padx=(12, 0))
+        self.report_type = ttk.Combobox(bar, state="readonly", width=25,
+            values=("Öğrenci yoklama özeti", "Günlük yoklama listesi", "Ödev teslim durumu", "Öğrenci ödev özeti"))
+        self.report_type.set("Öğrenci yoklama özeti")
+        self.report_type.pack(side="left", padx=6)
+        ttk.Label(bar, text="Başlangıç:").pack(side="left", padx=(12, 0))
+        self.report_start = ttk.Entry(bar, width=12)
+        self.report_start.insert(0, date.today().replace(day=1).isoformat())
+        self.report_start.pack(side="left", padx=5)
+        ttk.Label(bar, text="Bitiş:").pack(side="left")
+        self.report_end = ttk.Entry(bar, width=12)
+        self.report_end.insert(0, TODAY)
+        self.report_end.pack(side="left", padx=5)
+        ttk.Button(bar, text="Raporu göster", command=self.generate_report).pack(side="right", padx=(8, 0))
+        ttk.Button(bar, text="CSV dışa aktar", style="Primary.TButton", command=self.export_report).pack(side="right")
+        self.report_tree = self.make_tree(body, ("one", "two", "three", "four", "five", "six", "seven", "eight"),
+            ("Alan 1", "Alan 2", "Alan 3", "Alan 4", "Alan 5", "Alan 6", "Alan 7", "Alan 8"),
+            (150, 150, 145, 110, 110, 110, 110, 130), height=18)
+        self.report_data = ([], [])
+        self.generate_report()
+
+    def report_rows(self):
+        start = self.valid_date(self.report_start.get())
+        end = self.valid_date(self.report_end.get())
+        if start > end:
+            raise ValueError("Başlangıç tarihi bitiş tarihinden sonra olamaz.")
+        class_id = self.report_class_map.get(self.report_class.get(), 0)
+        kind = self.report_type.get()
+        if kind == "Öğrenci yoklama özeti":
+            headers = ["Sınıf", "Öğrenci no", "Öğrenci", "Geldi", "Gelmedi", "Geç geldi", "İzinli", "Devamsızlık oranı %"]
+            rows = self.query("""SELECT c.name, st.student_no, st.first_name, st.last_name,
+                SUM(CASE WHEN at.status='Geldi' THEN 1 ELSE 0 END) AS present,
+                SUM(CASE WHEN at.status='Gelmedi' THEN 1 ELSE 0 END) AS absent,
+                SUM(CASE WHEN at.status='Geç geldi' THEN 1 ELSE 0 END) AS late,
+                SUM(CASE WHEN at.status='İzinli' THEN 1 ELSE 0 END) AS excused, COUNT(at.id) AS total
+                FROM students st JOIN classes c ON c.id=st.class_id
+                LEFT JOIN attendance_sessions se ON se.class_id=st.class_id AND se.attendance_date BETWEEN ? AND ?
+                LEFT JOIN attendance at ON at.session_id=se.id AND at.student_id=st.id
+                WHERE st.active=1 AND (?=0 OR st.class_id=?)
+                GROUP BY st.id ORDER BY c.name, st.last_name, st.first_name""",
+                (start, end, class_id, class_id))
+            data = [(r["name"], r["student_no"], f'{r["first_name"]} {r["last_name"]}', r["present"] or 0,
+                     r["absent"] or 0, r["late"] or 0, r["excused"] or 0,
+                     round((r["absent"] or 0) * 100 / r["total"], 1) if r["total"] else 0) for r in rows]
+            return headers, data
+        if kind == "Günlük yoklama listesi":
+            headers = ["Tarih", "Sınıf", "Öğrenci no", "Öğrenci", "Durum"]
+            rows = self.query("""SELECT se.attendance_date, c.name, st.student_no, st.first_name, st.last_name,
+                COALESCE(at.status, 'İşaretlenmedi') AS status
+                FROM attendance_sessions se JOIN classes c ON c.id=se.class_id
+                JOIN students st ON st.class_id=se.class_id AND st.active=1
+                LEFT JOIN attendance at ON at.session_id=se.id AND at.student_id=st.id
+                WHERE se.attendance_date BETWEEN ? AND ? AND (?=0 OR se.class_id=?)
+                ORDER BY se.attendance_date, c.name, st.last_name, st.first_name""",
+                (start, end, class_id, class_id))
+            return headers, [(r["attendance_date"], r["name"], r["student_no"],
+                              f'{r["first_name"]} {r["last_name"]}', r["status"]) for r in rows]
+        if kind == "Öğrenci ödev özeti":
+            headers = ["Sınıf", "Öğrenci no", "Öğrenci", "Atanan", "Teslim edilen", "Bekleyen / eksik", "Puan ortalaması"]
+            rows = self.query("""SELECT c.name, st.student_no, st.first_name, st.last_name,
+                COUNT(s.assignment_id) AS assigned,
+                SUM(CASE WHEN s.status IN ('Teslim edildi','Geç teslim edildi') THEN 1 ELSE 0 END) AS delivered,
+                SUM(CASE WHEN s.status IN ('Bekleniyor','Eksik') THEN 1 ELSE 0 END) AS remaining,
+                AVG(s.score) AS average_score FROM students st JOIN classes c ON c.id=st.class_id
+                LEFT JOIN assignments a ON a.class_id=st.class_id AND a.due_date BETWEEN ? AND ?
+                LEFT JOIN assignment_submissions s ON s.assignment_id=a.id AND s.student_id=st.id
+                WHERE st.active=1 AND (?=0 OR st.class_id=?)
+                GROUP BY st.id ORDER BY c.name, st.last_name, st.first_name""",
+                (start, end, class_id, class_id))
+            return headers, [(r["name"], r["student_no"], f'{r["first_name"]} {r["last_name"]}',
+                              r["assigned"] or 0, r["delivered"] or 0, r["remaining"] or 0,
+                              "" if r["average_score"] is None else round(r["average_score"], 1)) for r in rows]
+        headers = ["Sınıf", "Ödev", "Son tarih", "Öğrenci no", "Öğrenci", "Durum", "Puan", "Öğretmen notu"]
+        rows = self.query("""SELECT c.name, a.title, a.due_date, st.student_no, st.first_name,
+            st.last_name, s.status, s.score, s.teacher_note FROM assignment_submissions s
+            JOIN assignments a ON a.id=s.assignment_id JOIN classes c ON c.id=a.class_id
+            JOIN students st ON st.id=s.student_id WHERE a.due_date BETWEEN ? AND ?
+            AND (?=0 OR a.class_id=?) ORDER BY a.due_date, c.name, st.last_name""",
+            (start, end, class_id, class_id))
+        return headers, [(r["name"], r["title"], r["due_date"], r["student_no"],
+                          f'{r["first_name"]} {r["last_name"]}', r["status"], r["score"], r["teacher_note"]) for r in rows]
+
+    def generate_report(self):
+        try:
+            headers, rows = self.report_rows()
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Rapor oluşturulamadı", str(exc))
+            return
+        self.report_data = (headers, rows)
+        for item in self.report_tree.get_children():
+            self.report_tree.delete(item)
+        for index, col in enumerate(self.report_tree["columns"]):
+            if index < len(headers):
+                self.report_tree.heading(col, text=headers[index])
+                self.report_tree.column(col, width=145 if index < 3 else 120)
+            else:
+                self.report_tree.heading(col, text="")
+                self.report_tree.column(col, width=0, stretch=False)
+        for row in rows:
+            self.report_tree.insert("", "end", values=row)
+
+    def export_report(self):
+        if not self.report_data[0]:
+            self.generate_report()
+        headers, rows = self.report_data
+        if not headers:
+            return
+        path = filedialog.asksaveasfilename(title="CSV raporunu kaydet", defaultextension=".csv",
+            filetypes=(("CSV dosyası", "*.csv"),), initialfile="ogretmen_raporu.csv")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file, delimiter=";")
+                writer.writerow(headers)
+                writer.writerows(rows)
+            messagebox.showinfo("Dışa aktarıldı", f"Rapor kaydedildi:\n{path}")
+        except OSError as exc:
+            logging.exception("CSV dışa aktarılamadı")
+            messagebox.showerror("Dosya kaydedilemedi", str(exc))
+
+
+if __name__ == "__main__":
+    try:
+        app = TeacherAssistant()
+        app.mainloop()
+    except Exception:
+        logging.exception("Uygulama beklenmeyen bir hatayla durdu")
+        raise
